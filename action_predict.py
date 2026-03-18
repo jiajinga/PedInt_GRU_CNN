@@ -54,7 +54,7 @@ from tensorflow.keras.models import Model
 import numpy as np
 
 
-###############################################
+#####################语义分割##########################
 class DeepLabModel(object):
     """Class to load deeplab model and run inference."""
 
@@ -106,7 +106,7 @@ class DeepLabModel(object):
         seg_map = batch_seg_map[0]
         return resized_image, seg_map
 
-
+# 语义分割的可视化？
 def create_cityscapes_label_colormap():
     """Creates a label colormap used in CITYSCAPES segmentation benchmark.
     Returns:
@@ -164,6 +164,7 @@ def label_to_color_image(label):
     colormap = create_cityscapes_label_colormap()
     return colormap[label]
 
+# 上色？
 def init_canvas(width, height, color=(255, 255, 255)):
     canvas = np.ones((height, width, 3), dtype="uint8")
     (channel_b, channel_g, channel_r) = cv2.split(canvas)
@@ -220,6 +221,8 @@ def init_canvas(width, height, color=(255, 255, 255)):
 
 
 # TODO: Make all global class parameters to minimum , e.g. no model generation
+
+# 一个基本预测模型的接口？
 class ActionPredict(object):
     """
         A base interface class for creating prediction models
@@ -244,7 +247,7 @@ class ActionPredict(object):
         self._backbone = backbone
         self._generator = None # use data generator for train/test 
 
-    # Processing images anf generate features
+    # Processing images and generate features  处理图像并且生成视觉特征
     def load_images_crop_and_process(self, img_sequences, bbox_sequences,
                                      ped_ids, save_path,
                                      data_type='train',
@@ -495,7 +498,7 @@ class ActionPredict(object):
         return sequences, feat_shape
 
         # Processing images anf generate features
-
+# 似乎是光流
     def get_optical_flow(self, img_sequences, bbox_sequences,
                                      ped_ids, save_path,
                                      data_type='train',
@@ -619,6 +622,7 @@ class ActionPredict(object):
             feat_shape = sequences.shape[1:]
         return sequences, feat_shape
 
+# 获取原始序列数据
     def get_data_sequence(self, data_type, data_raw, opts):
         """
         Generates raw sequences from a given dataset
@@ -699,6 +703,7 @@ class ActionPredict(object):
 
         return d, neg_count, pos_count
 
+# 让数据均衡，通过重采样
     def balance_data_samples(self, d, img_width, balance_tag='crossing'):
         """
         Balances the ratio of positive and negative data samples. The less represented
@@ -770,6 +775,7 @@ class ActionPredict(object):
             print('Balanced:\t Positive: %d  \t Negative: %d\n'
                   % (num_pos_samples, len(d[balance_tag]) - num_pos_samples))
 
+# 获取更多样的特征
     def get_context_data(self, model_opts, data, data_type, feature_type):
         print('\n#####################################')
         print('Generating {} {}'.format(feature_type, data_type))
@@ -821,6 +827,7 @@ class ActionPredict(object):
                                                      process=process,
                                                      **data_gen_params)
 
+# 数据集划分
     def get_data(self, data_type, data_raw, model_opts):
         """
         Generates data train/test/val data

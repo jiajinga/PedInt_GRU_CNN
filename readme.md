@@ -53,6 +53,8 @@ Above operation will create a folder called `images` and save the extracted imag
 
 Note: our model extracts the semantic mask via DeeplabV3 (you need download pretrained segmentation model [deeplabv3](http://download.tensorflow.org/models/deeplabv3_mnv2_cityscapes_train_2018_02_05.tar.gz) before training and put checkpoint file into this project's root directory (as `./deeplabv3_mnv2_cityscapes_train_2018_02_05.tar.gz`) so that the model can obtain the input semantic data).    
 
+意思是所有的模型都要使用config_file文件夹里的配置文件来进行训练
+
 Use `train_test.py` script with `config_file`:
 ```
 python train_test.py -c <config_file>
@@ -60,6 +62,7 @@ python train_test.py -c <config_file>
 
 All config_files are saved in `./config_files` and you can review all offered model configs in `./config_files/config_list.yaml` and all offered model architectures in `./model_imgs` corresponding to configs.  
 
+举个例子
 For example, to train MASK-PCPA model run:  
 
 ```

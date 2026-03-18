@@ -9,6 +9,8 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Concatenate, Dense
 import tensorflow.keras.backend as K
 
+# 这个代码应该是建立基本模型
+# AlexNet  CNN的一种
 def AlexNet(include_top=True,
             weights=None,
             input_tensor=None,
@@ -63,7 +65,7 @@ def AlexNet(include_top=True,
 
     return model
 
-
+# 把一个CNN转换为FCN
 def convert_to_fcn(model, classes=2, activation='softmax',
                    pooling='avg', features=False, model_type='alexnet'):
     """
@@ -96,7 +98,7 @@ def convert_to_fcn(model, classes=2, activation='softmax',
         x = Activation(activation)(x)
     return Model(model.input, x)
 
-
+# 3D CNN
 def C3DNet(freeze_conv_layers=False, weights=None,
            dense_activation='softmax', dropout=0.5, include_top=False,input_data = Input(shape=(16, 112, 112, 3))):
     """

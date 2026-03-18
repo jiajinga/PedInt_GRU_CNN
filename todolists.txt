@@ -1,3 +1,5 @@
-1. 查看如何上传到github进行版本控制
+1. 查看如何上传到github进行版本控制✅
 2. 了解清楚每一个文件的作用
 3. 如果要在pycharm里面运行.sh文件需要相应地进行修改，就像vscode那样
+4. deeplabv3 is in need
+5. create environment -> tensorflow-gpu=3.2
