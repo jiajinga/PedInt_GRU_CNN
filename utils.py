@@ -1,3 +1,5 @@
+# 应该是数据处理相关代码，特别是针对姿势特征、图像大小、边界框之类的，光流也还有一些设置、处理，
+# 以及文件处理，生成模型的保存路径等等
 import sys
 import PIL
 import os
@@ -8,6 +10,7 @@ from tensorflow.keras.preprocessing.image import load_img
 from sklearn.metrics import accuracy_score
 
 # Data utilities
+# 对行人骨架进行翻转（以0.5作为对称轴），但仍然保持原先的先右后左（图片上，非真实）的顺序存储
 def flip_pose(pose):
     """
     Flips a given pose coordinates
@@ -33,6 +36,7 @@ def flip_pose(pose):
     return flip_pose
 
 
+# 获取行人姿势坐标 (both PIE and JAAD is available, default is PIE)
 def get_pose(img_sequences,
              ped_ids, file_path,
              data_type='train',
@@ -94,6 +98,7 @@ def get_pose(img_sequences,
     return poses_all
 
 
+# 对行人边界框进行变化，方便获取 local context
 def jitter_bbox(img_path, bbox, mode, ratio):
     """
     Jitters the position or dimensions of the bounding box.
@@ -158,13 +163,14 @@ def jitter_bbox(img_path, bbox, mode, ratio):
         b[2] = b[2] + width_change // 2
         b[3] = b[3] + height_change // 2
 
-        # Checks to make sure the bbox is not exiting the image boundaries
+        # Checks to make sure the bbox is not existing the image boundaries
         b = bbox_sanity_check(img.size, b)
         jit_boxes.append(b)
     # elif crop_opts['mode'] == 'border_only':
     return jit_boxes
 
 
+# 调整边界框大小，使之变成方形，依据高度和要调整的程度来定方框
 def squarify(bbox, squarify_ratio, img_width):
     """
     Changes the dimensions of a bounding box to a fixed ratio
@@ -193,6 +199,7 @@ def squarify(bbox, squarify_ratio, img_width):
     return bbox
 
 
+# 用来展示处理图片数量的进度的
 def update_progress(progress):
     """
     Shows the progress
@@ -210,6 +217,7 @@ def update_progress(progress):
     sys.stdout.flush()
 
 
+# 似乎是用来将图片的大小变为指定大小，但是也没用这个函数
 def img_pad_pil(img, mode='warp', size=224):
     """
     Pads and/or resizes a given image
@@ -247,18 +255,20 @@ def img_pad_pil(img, mode='warp', size=224):
                                    (size - img_size[1]) // 2))
         return padded_image
 
+
+# 这个是启用版，调整图片大小到指定大小，通过裁切或者填充的方式
 def img_pad(img, mode='warp', size=224):
     """
     Pads and/or resizes a given image
     Args:
         img: The image to be coropped and/or padded
         mode: The type of padding or resizing. Options are,
-            warp: crops the bounding box and resize to the output size
+            warp: crops the bounding box and resize to the output size, "bounding box"，直接resize到指定尺寸
             same: only crops the image
-            pad_same: maintains the original size of the cropped box  and pads with zeros
+            pad_same: maintains the original size of the cropped box and pads with zeros
             pad_resize: crops the image and resize the cropped box in a way that the longer edge is equal to
                         the desired output size in that direction while maintaining the aspect ratio. The rest
-                        of the image is	padded with zeros
+                        of the image is	padded with zeros, "contex/surround"  只保证长边是满足的，剩余填充
             pad_fit: maintains the original size of the cropped box unless the image is bigger than the size
                     in which case it scales the image down, and then pads it
         size: Target size of image
@@ -286,6 +296,7 @@ def img_pad(img, mode='warp', size=224):
         return padded_image
 
 
+# 检查边界框是否在合理范围内
 def bbox_sanity_check(img_size, bbox):
     """
     Checks whether  bounding boxes are within image boundaries.
@@ -308,6 +319,7 @@ def bbox_sanity_check(img_size, bbox):
     return bbox
 
 
+# 为保存模型和配置文件数据生成保存路径
 def get_path(file_name='',
              sub_folder='',
              save_folder='models',
@@ -336,6 +348,7 @@ SMALLFLOW = 0.0
 LARGEFLOW = 1e8
 
 
+# 读取光流文件
 def read_flow_file(optflow_path):
     with open(optflow_path, 'rb') as f:
         tag = np.fromfile(f, np.float32, count=1)
@@ -346,6 +359,9 @@ def read_flow_file(optflow_path):
         data2d = np.fromfile(f, np.float32, count=2 * w * h)
         # reshape data into 3D array (columns, rows, channels)
         return np.resize(data2d, (h, w, 2))
+
+
+# 向光流文件进行写入
 def write_flow(flow, optflow_path):
     with open(optflow_path, 'wb') as f:
         magic = np.array([202021.25], dtype=np.float32)
@@ -358,6 +374,7 @@ def write_flow(flow, optflow_path):
         flow.tofile(f)
 
 
+# 光流数据编码为颜色
 def make_color_wheel():
     """
     Generate color wheel according Middlebury color code
@@ -406,6 +423,9 @@ def make_color_wheel():
     colorwheel[col:col+MR, 0] = 255
 
     return colorwheel
+
+
+# 计算光流对应的颜色
 def compute_color(u, v):
     """
     compute optical flow color map
@@ -448,6 +468,9 @@ def compute_color(u, v):
         img[:, :, i] = np.uint8(np.floor(255 * col * (1 - nanIdx)))
 
     return img
+
+
+# 可视化光流
 def flow_to_image(flow):
     """
     Convert flow into middlebury color code image
@@ -488,6 +511,7 @@ def flow_to_image(flow):
     return np.uint8(img)
 
 
+# 评估指标计算函数 (time to event)
 def tte_weighted_acc(tte, gt, y, weights='quadratic'):
     """
     A function to compute time-to-event (TTE) weighted accuracy: 

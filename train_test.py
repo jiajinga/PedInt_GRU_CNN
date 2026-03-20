@@ -1,4 +1,5 @@
 """Summary
+模型训练和测试
 """
 import os
 import yaml
@@ -31,7 +32,7 @@ for gpu in gpus:
 
 
 
-# path to JAAD dataset, please change to your local path
+# path to JAAD and PIE dataset, please change to your local path
 path_jaad = "/home/steven/submission_T_IV/JAAD"
 path_pie = "/media/steven/MEDIA/PIE"
 
@@ -151,7 +152,7 @@ def run(config_file=None):
             # if use docker:
             # imdb = JAAD(data_path=os.environ.copy()['JAAD_PATH'])
 
-            # if use local path
+            # if use local path:
             imdb = JAAD(data_path=path_jaad)
 
         # get sequences

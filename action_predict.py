@@ -1,4 +1,4 @@
-
+# 应该是一个模型合集
 import time
 import yaml
 import wget
@@ -897,6 +897,7 @@ class ActionPredict(object):
                 'data_params': {'data_types': data_types, 'data_sizes': data_sizes},
                 'count': {'neg_count': neg_count, 'pos_count': pos_count}}
 
+# 记录模型的配置
     def log_configs(self, config_path, batch_size, epochs,
                     lr, model_opts):
 
@@ -931,6 +932,7 @@ class ActionPredict(object):
 
         print('Wrote configs to {}'.format(config_path))
 
+# 对每个类别增加权重（后期如果改变类别数量需要修改该函数）
     def class_weights(self, apply_weights, sample_count):
         """
         Computes class weights for imbalanced data used during training
@@ -955,6 +957,7 @@ class ActionPredict(object):
         print("### Class weights: negative {:.3f} and positive {:.3f} ###".format(neg_weight, pos_weight))
         return {0: neg_weight, 1: pos_weight}
 
+# 记录训练过程的反馈
     def get_callbacks(self, learning_scheduler, model_path):
         """
         Creates a list of callabcks for training
@@ -991,6 +994,7 @@ class ActionPredict(object):
 
         return callbacks
 
+# 获取优化器（自适应调整参数的学习率）
     def get_optimizer(self, optimizer):
         """
         Return an optimizer object
@@ -1008,6 +1012,7 @@ class ActionPredict(object):
         elif optimizer.lower() == 'rmsprop':
             return RMSprop
 
+# 模型训练函数
     def train(self, data_train,
               data_val,
               batch_size=2,
@@ -1017,7 +1022,7 @@ class ActionPredict(object):
               learning_scheduler=None,
               model_opts=None):
         """
-        Trains the models
+        Train the models
         Args:
             data_train: Training data
             data_val: Validation data
@@ -1085,10 +1090,11 @@ class ActionPredict(object):
 
         return saved_files_path
 
+# 模型测试函数
     # Test Functions
     def test(self, data_test, model_path=''):
         """
-        Evaluates a given model
+        Evaluate a given model
         Args:
             data_test: Test data
             model_path: Path to folder containing the model and options
@@ -1144,6 +1150,7 @@ class ActionPredict(object):
                 yaml.dump(results, fid)
         return acc, auc, f1, precision, recall
 
+# 获取模型
     def get_model(self, data_params):
         """
         Generates a model
@@ -1154,7 +1161,8 @@ class ActionPredict(object):
         """
         raise NotImplementedError("get_model should be implemented")
 
-    # Auxiliary function
+# Auxiliary function 辅助函数
+    # GRU
     def _gru(self, name='gru', r_state=False, r_sequence=False):
         """
         A helper function to create a single GRU unit
@@ -1174,6 +1182,7 @@ class ActionPredict(object):
                    bias_regularizer=self._regularizer,
                    name=name)
 
+    # LSTM
     def _lstm(self, name='lstm', r_state=False, r_sequence=False):
         """
         A helper function to create a single LSTM unit
@@ -1193,6 +1202,7 @@ class ActionPredict(object):
                     bias_regularizer=self._regularizer,
                     name=name)
 
+    # 把 recurrent cells 累积起来
     def create_stack_rnn(self, size, r_state=False, r_sequence=False):
         """
         Creates a stack of recurrent cells
@@ -1212,6 +1222,7 @@ class ActionPredict(object):
         return RNN(cells, return_sequences=r_sequence, return_state=r_state)
 
 
+# RNN
 class SingleRNN(ActionPredict):
     """ A simple recurrent network """
     def __init__(self,
@@ -1228,6 +1239,7 @@ class SingleRNN(ActionPredict):
         self._num_hidden_units = num_hidden_units
         self._rnn_type = cell_type
 
+# 获取模型 (GRU or LSTM)
     def get_model(self, data_params):
         network_inputs = []
         data_sizes = data_params['data_sizes']
@@ -1254,6 +1266,7 @@ class SingleRNN(ActionPredict):
         return net_model
 
 
+# stacked RNN
 class StackedRNN(ActionPredict):
     """ A stacked recurrent prediction model based on
     Yue-Hei et al. "Beyond short snippets: Deep networks for video classification."
@@ -1294,6 +1307,7 @@ class StackedRNN(ActionPredict):
         return net_model
 
 
+# multi-stream RNN
 class MultiRNN(ActionPredict):
     """
     A multi-stream recurrent prediction model inspired by
@@ -1339,6 +1353,7 @@ class MultiRNN(ActionPredict):
         return net_model
 
 
+# hierarchical RNN  分层RNN
 class HierarchicalRNN(ActionPredict):
     """
     A Hierarchical recurrent prediction model inspired by
@@ -1387,6 +1402,7 @@ class HierarchicalRNN(ActionPredict):
         return net_model
 
 
+# SFRNN  基线对比模型
 class SFRNN(ActionPredict):
     """
     Pedestrian crossing prediction based on
@@ -1434,6 +1450,7 @@ class SFRNN(ActionPredict):
         return net_model
 
 
+# C3D   3d CNN? 是用来完成视频理解的，与前面不同，多了个get_data的重写，或许是因为它处理的是图像数据？
 class C3D(ActionPredict):
     """
     C3D code based on
@@ -1489,6 +1506,7 @@ class C3D(ActionPredict):
         return net_model
 
 
+# I3D   同上，get_data
 class I3D(ActionPredict):
     """
     A single I3D method based on
@@ -1550,6 +1568,7 @@ class I3D(ActionPredict):
         return net_model
 
 
+# 双流 I3D
 class TwoStreamI3D(ActionPredict):
     """
     Two-stream 3D method based on
@@ -1744,6 +1763,7 @@ class TwoStreamI3D(ActionPredict):
         return acc, auc, f1, precision, recall
 
 
+# 将从最后的卷积层中获取到的特征输入到 a dense layer 来分类
 class Static(ActionPredict):
     """
     A static model which uses features from the last convolution
@@ -1894,6 +1914,7 @@ class Static(ActionPredict):
         return net_model
 
 
+# convLSTM  混合架构
 class ConvLSTM(ActionPredict):
     """
     A Convolutional LSTM model for sequence learning
@@ -1953,6 +1974,7 @@ class ConvLSTM(ActionPredict):
         return net_model
 
 
+# MASK convLSTM
 class MASK_ConvLSTM(ActionPredict):
     """
     A Convolutional LSTM model for sequence learning
@@ -2034,6 +2056,7 @@ class MASK_ConvLSTM(ActionPredict):
         return net_model
 
 
+# 对 Rasouli 等人的 "Are they going to cross?" 的复现
 class ATGC(ActionPredict):
     """
     This is an implementation of pedestrian crossing prediction model based on
@@ -2550,6 +2573,7 @@ class ATGC(ActionPredict):
         return acc, auc, f1, precision, recall
 
 
+# 双流 CNN
 class TwoStream(ActionPredict):
     """
     This is an implementation of two-stream network based on
@@ -2950,6 +2974,7 @@ class TwoStream(ActionPredict):
         return acc, auc, f1, precision, recall
 
 
+# 双流 CNN 融合
 class TwoStreamFusion(ActionPredict):
     """
     This is an implementation of two-stream network with fusion mechanisms based
@@ -3382,6 +3407,7 @@ class TwoStreamFusion(ActionPredict):
         return acc, auc, f1, precision, recall
 
 
+# 注意力机制
 def attention_3d_block(hidden_states, dense_size=128, modality=''):
     """
     Many-to-one attention mechanism for Keras.
@@ -3407,6 +3433,7 @@ def attention_3d_block(hidden_states, dense_size=128, modality=''):
     return attention_vector
 
 
+# MASK PCPA  （这个似乎是作者的模型）
 class MASK_PCPA(ActionPredict):
 
     """
@@ -3594,6 +3621,7 @@ class MASK_PCPA(ActionPredict):
         return net_model
 
 
+# MASK PCPA 2
 class MASK_PCPA_2(ActionPredict):
     """
 
@@ -3791,6 +3819,7 @@ class MASK_PCPA_2(ActionPredict):
         return net_model
 
 
+# MASK PCPA 3
 class MASK_PCPA_3(ActionPredict):
     """
 
@@ -3998,6 +4027,8 @@ class MASK_PCPA_3(ActionPredict):
         plot_model(net_model, to_file='model_imgs/MASK_PCPA_3.png')
         return net_model
 
+
+# MASK C3D
 class  MASK_C3D(ActionPredict):
     """
 
@@ -4186,6 +4217,8 @@ class  MASK_C3D(ActionPredict):
         plot_model(net_model, to_file='model_imgs/MASK_C3D.png')
         return net_model
 
+
+# original C3D
 class  ORI_C3D(ActionPredict):
     """
 
@@ -4376,6 +4409,7 @@ class  ORI_C3D(ActionPredict):
         return net_model
 
 
+# PCPA （基线模型）
 class PCPA(ActionPredict):
 
     """
@@ -4533,6 +4567,8 @@ class PCPA(ActionPredict):
         plot_model(net_model, to_file='model_imgs/PCPA.png')
         return net_model
 
+
+# PCPA 2D （基线模型）
 class PCPA_2D(ActionPredict):
 
     """
@@ -4727,6 +4763,7 @@ class PCPA_2D(ActionPredict):
         net_model.summary()
         plot_model(net_model, to_file='model_imgs/PCPA_2D.png')
         return net_model
+
 
 class MASK_PCPA_2D(ActionPredict):
 
@@ -5160,7 +5197,6 @@ class MASK_PCPA_2_2D(ActionPredict):
         net_model.summary()
         plot_model(net_model, to_file='model_imgs/MASK_PCPA_2_2D.png')
         return net_model
-
 
 
 class MASK_PCPA_3_2D(ActionPredict):

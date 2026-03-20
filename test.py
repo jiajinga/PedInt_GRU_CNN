@@ -1,3 +1,4 @@
+# 这个是针对有预训练模型的情况
 from action_predict import action_prediction
 # from pie_data import PIE
 from jaad_data import JAAD
