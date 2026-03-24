@@ -213,16 +213,11 @@ def init_canvas(width, height, color=(255, 255, 255)):
 #     ax.tick_params(width=0.0)
 #     plt.grid('off')
 #     plt.show()
-
-
-
 ################################################
-
-
-
 # TODO: Make all global class parameters to minimum , e.g. no model generation
 
-# 一个基本预测模型的接口？
+
+"""一个基本预测模型的接口？后面的一些模型都是它的继承"""
 class ActionPredict(object):
     """
         A base interface class for creating prediction models
@@ -283,7 +278,7 @@ class ActionPredict(object):
         """
         base_model = VGG19(weights='imagenet')
         VGGmodel = Model(inputs=base_model.input, outputs=base_model.get_layer('block4_pool').output)
-        # load the feature files if exists
+        # load the feature files if exists   你也没 load 啊
         print("Generating {} features crop_type={} crop_mode={}\
               \nsave_path={}, ".format(data_type, crop_type, crop_mode,
                                        save_path))
@@ -301,7 +296,7 @@ class ActionPredict(object):
         preprocess_dict = {'vgg16': vgg16.preprocess_input, 'resnet50': resnet50.preprocess_input}
         backbone_dict = {'vgg16': vgg16.VGG16, 'resnet50': resnet50.ResNet50}
 
-        preprocess_input = preprocess_dict.get(self._backbone, None)
+        preprocess_input = preprocess_dict.get(self._backbone, None)   # 意思应该就是获取对应 backbone 的 input
         if process:
             assert (self._backbone in ['vgg16', 'resnet50']), "{} is not supported".format(self._backbone)
 
@@ -336,15 +331,15 @@ class ActionPredict(object):
                             except:
                                 img_features = pickle.load(fid, encoding='bytes')
                 else:
-                    if 'flip' in imp:
+                    if 'flip' in imp:  # 检查是否需要对骨架进行翻转
                         imp = imp.replace('_flip', '')
                         flip_image = True
-                    if crop_type == 'none':
+                    if crop_type == 'none':  # 检查是否需要对图像进行裁切处理，这个条件->全局图像
                         img_data = cv2.imread(imp)
                         img_features = cv2.resize(img_data, target_dim)
                         if flip_image:
                             img_features = cv2.flip(img_features, 1)
-                    elif crop_type == 'local_context_cnn':
+                    elif crop_type == 'local_context_cnn':   # 对应 局部特征
                         img = image.load_img(imp, target_size=(224, 224))
                         x = image.img_to_array(img)
                         x = np.expand_dims(x, axis=0)

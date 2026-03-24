@@ -263,14 +263,14 @@ def img_pad(img, mode='warp', size=224):
     Args:
         img: The image to be coropped and/or padded
         mode: The type of padding or resizing. Options are,
-            warp: crops the bounding box and resize to the output size, "bounding box"，直接resize到指定尺寸
-            same: only crops the image
-            pad_same: maintains the original size of the cropped box and pads with zeros
+            warp: crops the bounding box and resize to the output size, 针对"bounding box"，直接resize到指定尺寸
+            same: only crops the image，对图片不做任何修改
+            pad_same: maintains the original size of the cropped box and pads with zeros  不改变图像尺寸，直接将其放到黑色画布上
             pad_resize: crops the image and resize the cropped box in a way that the longer edge is equal to
                         the desired output size in that direction while maintaining the aspect ratio. The rest
-                        of the image is	padded with zeros, "contex/surround"  只保证长边是满足的，剩余填充
+                        of the image is	padded with zeros, "contex/surround"  只保证长边是满足的，剩余黑色填充（最常用）
             pad_fit: maintains the original size of the cropped box unless the image is bigger than the size
-                    in which case it scales the image down, and then pads it
+                    in which case it scales the image down, and then pads it  自适应。在pad_same和pad_resize中自选择
         size: Target size of image
     Return:
         Padded image

@@ -92,10 +92,11 @@ class JAAD(object):
         """
         return 'dataset/jaad'
 
+    # 为分割的数据集准备对应的 video clips'id
     def _get_video_ids_split(self, image_set, subset='default'):
         """
         Returns a list of video ids for a given data split
-        :param image_set: Data split, train, test, val
+        :param: image_set: Data split, train, test, val
         :return: The list of video ids
         """
         vid_ids = []

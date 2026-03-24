@@ -33,7 +33,7 @@ for gpu in gpus:
 
 
 # path to JAAD and PIE dataset, please change to your local path
-path_jaad = "/home/steven/submission_T_IV/JAAD"
+path_jaad = "JAAD"
 path_pie = "/media/steven/MEDIA/PIE"
 
 # config = tf.compat.v1.ConfigProto()
@@ -89,15 +89,15 @@ def run(config_file=None):
         dataset: dataset to train and test the model on (pie, jaad_beh or jaad_all)
     """
     print(config_file)
-    # Read default Config file
+    # Read default Config file   设置最基础的训练参数
     configs_default ='config_files/configs_default.yaml'
     with open(configs_default, 'r') as f:
         configs = yaml.safe_load(f)
-
+    # 模型具体参数
     with open(config_file, 'r') as f:
         model_configs = yaml.safe_load(f)
 
-    # Update configs based on the model configs
+    # Update configs based on the model configs  对应地将 'model_opts', 'net_opts' 更换为模型配置文件中的参数
     for k in ['model_opts', 'net_opts']:
         if k in model_configs:
             configs[k].update(model_configs[k])
@@ -116,9 +116,9 @@ def run(config_file=None):
 
         # print('===> GPU memory cleared')
 
-        configs['data_opts']['sample_type'] = 'beh' if 'beh' in dataset else 'all'
+        configs['data_opts']['sample_type'] = 'beh' if 'beh' in dataset else 'all'  # 提前确定好JAAD数据集类型
         configs['model_opts']['overlap'] = 0.6 if 'pie' in dataset else 0.8
-        configs['model_opts']['dataset'] = dataset.split('_')[0]
+        configs['model_opts']['dataset'] = dataset.split('_')[0]  # 分割只保留数据集名称
         configs['train_opts']['batch_size'] = model_configs['exp_opts']['batch_size'][dataset_idx]
         configs['train_opts']['lr'] = model_configs['exp_opts']['lr'][dataset_idx]
         configs['train_opts']['epochs'] = model_configs['exp_opts']['epochs'][dataset_idx]
@@ -126,7 +126,7 @@ def run(config_file=None):
         model_name = configs['model_opts']['model']
         # Remove speed in case the dataset is jaad
         if 'RNN' in model_name and 'jaad' in dataset:
-            configs['model_opts']['obs_input_type'] = configs['model_opts']['obs_input_type']
+            configs['model_opts']['obs_input_type'] = configs['model_opts']['obs_input_type']  # 这一句看起来似乎有问题
 
         for k, v in configs.items():
             print(k,v)
@@ -157,9 +157,9 @@ def run(config_file=None):
 
         # get sequences
         beh_seq_train = imdb.generate_data_trajectory_sequence('train', **configs['data_opts'])
-        beh_seq_val = None
+        # beh_seq_val = None   # 不分配验证集吗？
         # Uncomment the line below to use validation set
-        # beh_seq_val = imdb.generate_data_trajectory_sequence('val', **configs['data_opts'])
+        beh_seq_val = imdb.generate_data_trajectory_sequence('val', **configs['data_opts'])
         beh_seq_test = imdb.generate_data_trajectory_sequence('test', **configs['data_opts']) ## load_dataset
 
         # get the model

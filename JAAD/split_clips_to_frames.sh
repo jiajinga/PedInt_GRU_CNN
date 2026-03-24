@@ -3,7 +3,7 @@
 #If you don't have ffmpeg installed on your system
 #run sudo apt-get install ffmpeg
 
-CLIPS_DIR=JAAD/JAAD_clips  #path to the directory with mp4 videos
+CLIPS_DIR=JAAD_clips  #path to the directory with mp4 videos
 FRAMES_DIR=images  #path to the directory for frames
 
 ################################################################
