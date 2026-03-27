@@ -106,7 +106,8 @@ class DeepLabModel(object):
         seg_map = batch_seg_map[0]
         return resized_image, seg_map
 
-# 语义分割的可视化？
+# 语义分割的可视化，根据 CITYSCAPES 数据集的标签定义，创建一个标签颜色映射表，之后可以用这个映射表将语义分割的结果转换为彩色图像进行可视化
+# 标签映射成颜色
 def create_cityscapes_label_colormap():
     """Creates a label colormap used in CITYSCAPES segmentation benchmark.
     Returns:
@@ -160,11 +161,12 @@ def create_cityscapes_label_colormap():
     return colormap
 
 
+# 将标签图像转换为彩色图像，输入是一个标签图像（每个像素的值表示该像素所属的类别），输出是一个彩色图像，其中每个类别被映射为一个特定的颜色，这样可以更直观地查看语义分割的结果
 def label_to_color_image(label):
     colormap = create_cityscapes_label_colormap()
     return colormap[label]
 
-# 上色？
+# 上色，根据给定的颜色值创建一个指定大小的纯色图像，这个函数在生成行人遮罩时可能会用到，通过创建一个纯色图像来突出显示行人区域
 def init_canvas(width, height, color=(255, 255, 255)):
     canvas = np.ones((height, width, 3), dtype="uint8")
     (channel_b, channel_g, channel_r) = cv2.split(canvas)
@@ -217,6 +219,7 @@ def init_canvas(width, height, color=(255, 255, 255)):
 # TODO: Make all global class parameters to minimum , e.g. no model generation
 
 
+##################模型创建##########################
 """一个基本预测模型的接口？后面的一些模型都是它的继承"""
 class ActionPredict(object):
     """
@@ -497,7 +500,7 @@ class ActionPredict(object):
         return sequences, feat_shape
 
         # Processing images anf generate features
-# 似乎是光流
+    # 似乎是光流，用来捕捉运动信息的，和上面那个函数很像，都是对图像进行处理并且生成特征的，区别在于这个是针对光流图的
     def get_optical_flow(self, img_sequences, bbox_sequences,
                                      ped_ids, save_path,
                                      data_type='train',
@@ -621,7 +624,7 @@ class ActionPredict(object):
             feat_shape = sequences.shape[1:]
         return sequences, feat_shape
 
-# 获取原始序列数据
+    # 获取原始序列数据，具体包括中心点、边界框、行人id、是否过马路、图像路径、速度、time to event等信息，并且根据选项进行数据增强和预处理，最终返回处理后的数据序列以及正负样本的数量
     def get_data_sequence(self, data_type, data_raw, opts):
         """
         Generates raw sequences from a given dataset
@@ -647,6 +650,7 @@ class ActionPredict(object):
         time_to_event = opts['time_to_event']
         normalize = opts['normalize_boxes']
 
+        # 速度的处理
         try:
             d['speed'] = data_raw['obd_speed'].copy()
         except KeyError:
@@ -656,8 +660,12 @@ class ActionPredict(object):
         if balance:
             self.balance_data_samples(d, data_raw['image_dimension'][0])
         d['box_org'] = d['box'].copy()
-        d['tte'] = []
+        d['tte'] = []   # time to event
 
+        # time to event 的处理，如果 time_to_event 是一个整数，说明我们只关心一个特定的时间点，
+        # 那么我们就从每个序列中提取出这个时间点之前的 obs_length 长度的序列，并且将 time_to_event 作为标签；
+        # 如果 time_to_event 是一个范围，说明我们关心这个范围内的所有时间点，
+        # 那么我们就从每个序列中提取出这个范围内的所有 obs_length 长度的序列，并且将对应的 time_to_event 作为标签
         if isinstance(time_to_event, int):
             for k in d.keys():
                 for i in range(len(d[k])):
@@ -681,6 +689,7 @@ class ActionPredict(object):
                 end_idx = len(seq) - obs_length - time_to_event[0]
                 d['tte'].extend([[len(seq) - (i + obs_length)] for i in
                                 range(start_idx, end_idx + 1, olap_res)])
+        # 归一化
         if normalize:
             for k in d.keys():
                 if k != 'tte':
@@ -695,6 +704,7 @@ class ActionPredict(object):
             for k in d.keys():
                 d[k] = np.array(d[k])
 
+        # crossing 标签的处理，提取出 crossing 标签的第一个元素作为最终的标签，并且统计正负样本的数量
         d['crossing'] = np.array(d['crossing'])[:, 0, :]
         pos_count = np.count_nonzero(d['crossing'])
         neg_count = len(d['crossing']) - pos_count
@@ -702,7 +712,7 @@ class ActionPredict(object):
 
         return d, neg_count, pos_count
 
-# 让数据均衡，通过重采样
+    # 让数据均衡，通过重采样
     def balance_data_samples(self, d, img_width, balance_tag='crossing'):
         """
         Balances the ratio of positive and negative data samples. The less represented
@@ -774,7 +784,7 @@ class ActionPredict(object):
             print('Balanced:\t Positive: %d  \t Negative: %d\n'
                   % (num_pos_samples, len(d[balance_tag]) - num_pos_samples))
 
-# 获取更多样的特征
+    # 为每个特征分配参数，并调用前面的特征生成函数进行处理
     def get_context_data(self, model_opts, data, data_type, feature_type):
         print('\n#####################################')
         print('Generating {} {}'.format(feature_type, data_type))
@@ -826,7 +836,7 @@ class ActionPredict(object):
                                                      process=process,
                                                      **data_gen_params)
 
-# 数据集划分
+    # 数据集生成
     def get_data(self, data_type, data_raw, model_opts):
         """
         Generates data train/test/val data
@@ -896,11 +906,10 @@ class ActionPredict(object):
                 'data_params': {'data_types': data_types, 'data_sizes': data_sizes},
                 'count': {'neg_count': neg_count, 'pos_count': pos_count}}
 
-# 记录模型的配置
+    # 记录模型的配置和训练参数，存放在configs.yaml
     def log_configs(self, config_path, batch_size, epochs,
                     lr, model_opts):
 
-        # TODO: Update config by adding network attributes
         """
         Logs the parameters of the model and training
         Args:
@@ -908,7 +917,7 @@ class ActionPredict(object):
             batch_size: Batch size of training
             epochs: Number of epochs for training
             lr: Learning rate of training
-            model_opts: Data generation parameters (see get_data)
+            model_opts: Data generation parameters (see get_data), model options
         """
         # Save config and training param files
         with open(config_path, 'wt') as fid:
@@ -931,7 +940,7 @@ class ActionPredict(object):
 
         print('Wrote configs to {}'.format(config_path))
 
-# 对每个类别增加权重（后期如果改变类别数量需要修改该函数）
+    # 对每个类别增加权重（后期如果改变类别数量需要修改该函数）
     def class_weights(self, apply_weights, sample_count):
         """
         Computes class weights for imbalanced data used during training
@@ -956,7 +965,7 @@ class ActionPredict(object):
         print("### Class weights: negative {:.3f} and positive {:.3f} ###".format(neg_weight, pos_weight))
         return {0: neg_weight, 1: pos_weight}
 
-# 记录训练过程的反馈
+    # 记录训练过程的反馈
     def get_callbacks(self, learning_scheduler, model_path):
         """
         Creates a list of callabcks for training
@@ -970,21 +979,21 @@ class ActionPredict(object):
         # Set up learning schedulers
         if learning_scheduler:
             callbacks = []
-            if 'early_stop' in learning_scheduler:
+            if 'early_stop' in learning_scheduler:  # 早停
                 default_params = {'monitor': 'val_loss',
                                   'min_delta': 1.0, 'patience': 5,
                                   'verbose': 1}
                 default_params.update(learning_scheduler['early_stop'])
                 callbacks.append(EarlyStopping(**default_params))
 
-            if 'plateau' in learning_scheduler:
+            if 'plateau' in learning_scheduler:  # 停滞
                 default_params = {'monitor': 'val_loss',
                                   'factor': 0.2, 'patience': 5,
                                   'min_lr': 1e-08, 'verbose': 1}
                 default_params.update(learning_scheduler['plateau'])
                 callbacks.append(ReduceLROnPlateau(**default_params))
 
-            if 'checkpoint' in learning_scheduler:
+            if 'checkpoint' in learning_scheduler:  # 检查点
                 default_params = {'filepath': model_path, 'monitor': 'val_loss',
                                   'save_best_only': True, 'save_weights_only': False,
                                   'save_freq': 'epoch', 'verbose': 2}
@@ -993,7 +1002,7 @@ class ActionPredict(object):
 
         return callbacks
 
-# 获取优化器（自适应调整参数的学习率）
+    # 获取优化器（自适应调整参数的学习率）
     def get_optimizer(self, optimizer):
         """
         Return an optimizer object
@@ -1011,7 +1020,7 @@ class ActionPredict(object):
         elif optimizer.lower() == 'rmsprop':
             return RMSprop
 
-# 模型训练函数
+    # 模型训练函数
     def train(self, data_train,
               data_val,
               batch_size=2,
@@ -1047,7 +1056,7 @@ class ActionPredict(object):
 
         if data_val is not None:
             data_val = self.get_data('val', data_val, {**model_opts, 'batch_size': batch_size})['data']
-            if self._generator:
+            if self._generator:  # 生成器，最后似乎返回的是一个生成器对象，images，可以 yield (x,y)
                 data_val = data_val[0]
 
         # Create model
@@ -1056,11 +1065,13 @@ class ActionPredict(object):
         # Train the model
         class_w = self.class_weights(model_opts['apply_class_weights'], data_train['count'])
         optimizer = self.get_optimizer(optimizer)(lr=lr)
-        train_model.compile(loss='binary_crossentropy', optimizer=optimizer, metrics=['accuracy'])
+        train_model.compile(loss='binary_crossentropy', optimizer=optimizer, metrics=['accuracy'])  # 双分类得改
+        # compile是 Keras 模型的编译函数，指定损失函数、优化器和评估指标等参数
         ## reivse fit
         callbacks = self.get_callbacks(learning_scheduler, model_path)
 
         # data_val = data_val.batch(batch_size)
+        # 这里的 fit 是 Keras 模型的训练函数，输入训练数据、标签、批大小、迭代次数、验证数据、类别权重、回调函数等参数，返回训练历史记录
         history = train_model.fit(x=data_train['data'][0],
                                   y=None if self._generator else data_train['data'][1],
                                   batch_size=None,
@@ -1089,8 +1100,7 @@ class ActionPredict(object):
 
         return saved_files_path
 
-# 模型测试函数
-    # Test Functions
+    # 模型测试函数
     def test(self, data_test, model_path=''):
         """
         Evaluate a given model
@@ -1149,7 +1159,7 @@ class ActionPredict(object):
                 yaml.dump(results, fid)
         return acc, auc, f1, precision, recall
 
-# 获取模型
+    # 获取模型
     def get_model(self, data_params):
         """
         Generates a model
@@ -1160,7 +1170,7 @@ class ActionPredict(object):
         """
         raise NotImplementedError("get_model should be implemented")
 
-# Auxiliary function 辅助函数
+    ########## Auxiliary functions #########
     # GRU
     def _gru(self, name='gru', r_state=False, r_sequence=False):
         """
