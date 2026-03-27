@@ -276,7 +276,8 @@ class ActionPredict(object):
             Numpy array of visual features
             Tuple containing the size of features
         """
-        base_model = VGG19(weights='imagenet')
+        base_model = VGG19(weights='imagenet')  # 基础模型
+        # 将VGG的输出改为 block4_pool 的输出，作为特征提取的结果，这个模型是专门用来处理 local_context_cnn 和 mask_cnn 的
         VGGmodel = Model(inputs=base_model.input, outputs=base_model.get_layer('block4_pool').output)
         # load the feature files if exists   你也没 load 啊
         print("Generating {} features crop_type={} crop_mode={}\
@@ -292,7 +293,7 @@ class ActionPredict(object):
 
         FULL_LABEL_MAP = np.arange(len(LABEL_NAMES)).reshape(len(LABEL_NAMES), 1)
         FULL_COLOR_MAP = label_to_color_image(FULL_LABEL_MAP)
-        ##########################
+        ############进行预处理？##############
         preprocess_dict = {'vgg16': vgg16.preprocess_input, 'resnet50': resnet50.preprocess_input}
         backbone_dict = {'vgg16': vgg16.VGG16, 'resnet50': resnet50.ResNet50}
 
@@ -300,15 +301,18 @@ class ActionPredict(object):
         if process:
             assert (self._backbone in ['vgg16', 'resnet50']), "{} is not supported".format(self._backbone)
 
+        # 创建CNN，通用特征提取器
         convnet = backbone_dict[self._backbone](input_shape=(224, 224, 3),
                                                 include_top=False, weights='imagenet') if process else None
         sequences = []
         bbox_seq = bbox_sequences.copy()
         i = -1
+        # 外层遍历每个行人
         for seq, pid in zip(img_sequences, ped_ids):
             i += 1
             update_progress(i / len(img_sequences))
             img_seq = []
+            # 内层遍历该行人的每一帧，对每一帧进行裁剪、预处理、特征提取，并进行保存，最终是在data/features目录下
             for imp, b, p in zip(seq, bbox_seq[i], pid):
                 flip_image = False
                 set_id = imp.split('/')[-3]
@@ -322,7 +326,7 @@ class ActionPredict(object):
                 else:
                     img_save_path = os.path.join(img_save_folder, img_name + '_' + p[0] + '.pkl')
 
-                # Check whether the file exists
+                # Check whether the file exists, 只要检测到文件存在就进行加载，否则就进行处理并保存 (for every frames)
                 if os.path.exists(img_save_path) and not regen_data:
                     if not self._generator:
                         with open(img_save_path, 'rb') as fid:
@@ -351,7 +355,7 @@ class ActionPredict(object):
                         # with tf.compact.v1.Session():
                         img_features = img_features.numpy()
 
-                    elif crop_type == 'mask_cnn':
+                    elif crop_type == 'mask_cnn':   # 对应 全局语义特征
                         img_data = cv2.imread(imp)
                         ori_dim = img_data.shape
                         # bbox = jitter_bbox(imp, [b], 'enlarge', crop_resize_ratio)[0]
@@ -425,17 +429,17 @@ class ActionPredict(object):
                         img_data = cv2.imread(imp)
                         if flip_image:
                             img_data = cv2.flip(img_data, 1)
-                        if crop_type == 'bbox':
+                        if crop_type == 'bbox':  # 边界框
                             b = list(map(int, b[0:4]))
                             cropped_image = img_data[b[1]:b[3], b[0]:b[2], :]
                             img_features = img_pad(cropped_image, mode=crop_mode, size=target_dim[0])
-                        elif 'context' in crop_type:
+                        elif 'context' in crop_type:  # local context
                             bbox = jitter_bbox(imp, [b], 'enlarge', crop_resize_ratio)[0]
                             bbox = squarify(bbox, 1, img_data.shape[1])
                             bbox = list(map(int, bbox[0:4]))
                             cropped_image = img_data[bbox[1]:bbox[3], bbox[0]:bbox[2], :]
                             img_features = img_pad(cropped_image, mode='pad_resize', size=target_dim[0])
-                        elif 'surround' in crop_type:
+                        elif 'surround' in crop_type:   # local surround
                             b_org = list(map(int, b[0:4])).copy()
                             bbox = jitter_bbox(imp, [b], 'enlarge', crop_resize_ratio)[0]
                             bbox = squarify(bbox, 1, img_data.shape[1])
@@ -445,9 +449,9 @@ class ActionPredict(object):
                             img_features = img_pad(cropped_image, mode='pad_resize', size=target_dim[0])
                         else:
                             raise ValueError('ERROR: Undefined value for crop_type {}!'.format(crop_type))
-                    if preprocess_input is not None:
+                    if preprocess_input is not None:  # 预处理
                         img_features = preprocess_input(img_features)
-                    if process:
+                    if process:   # 用通用特征提取器进行处理
                         expanded_img = np.expand_dims(img_features, axis=0)
                         img_features = convnet.predict(expanded_img)
                     # Save the file
@@ -5545,11 +5549,14 @@ class MASK_PCPA_4_2D(ActionPredict):
         attention_size = self._num_hidden_units
         for i in range(0, core_size):
             network_inputs.append(Input(shape=data_sizes[i], name='input_' + data_types[i]))
-
+        
+        """  # local_context
         x = self._rnn(name='enc0_' + data_types[0], r_sequence=return_sequence)(network_inputs[0])
         encoder_outputs.append(x)
+        # mask_cnn (global context)
         x = self._rnn(name='enc1_' + data_types[1], r_sequence=return_sequence)(network_inputs[1])
         encoder_outputs.append(x)
+        # pose
         x = self._rnn(name='enc2_' + data_types[2], r_sequence=return_sequence)(network_inputs[2])
         # current = [x, network_inputs[1]]
         # x = Concatenate(name='concat_early1', axis=2)(current)
@@ -5557,26 +5564,55 @@ class MASK_PCPA_4_2D(ActionPredict):
         # current = [x, network_inputs[2]]
         # x = Concatenate(name='concat_early2', axis=2)(current)
         # x = self._rnn(name='enc2_' + data_types[2], r_sequence=return_sequence)(x)
+
+        # box
         current = [x, network_inputs[3]]
         x = Concatenate(name='concat_early3', axis=2)(current)
         x = self._rnn(name='enc3_' + data_types[3], r_sequence=return_sequence)(x)
+        # speed
         current = [x,network_inputs[4]]
         x = Concatenate(name='concat_early4', axis=2)(current)
         x = self._rnn(name='enc4_' + data_types[4], r_sequence=return_sequence)(x)
         encoder_outputs.append(x)
+        """
 
+        # A分支：local context (+ mask if存在)
+        xA = self._rnn(name='enc0_' + data_types[0], r_sequence=return_sequence)(network_inputs[0])
+
+        if core_size >= 2 and data_types[1] == 'mask_cnn':
+            x = self._rnn(name='enc1_' + data_types[1], r_sequence=return_sequence)(network_inputs[1])
+            xA = Concatenate(name='concat_A', axis=2)([xA, x])
+            xA = self._rnn(name='encA', r_sequence=return_sequence)(xA)
+
+            b_start = 2
+        else:
+            # 直接把 local_context 作为 A
+            b_start = 1
+
+        encoder_outputs.append(xA)
+
+        # B分支：从剩下的modality依次融合
+        if b_start < core_size:
+            xB = self._rnn(name='encB0_' + data_types[b_start], r_sequence=return_sequence)(network_inputs[b_start])
+            for idx in range(b_start + 1, core_size):
+                xB = Concatenate(name=f'concat_B{idx}', axis=2)([xB, network_inputs[idx]])
+                xB = self._rnn(name=f'encB{idx}', r_sequence=return_sequence)(xB)
+            encoder_outputs.append(xB)
+        else:
+            encoder_outputs.append(xA)  # 保险 fallback
 
 
         if len(encoder_outputs) > 1:
             att_enc_out = []
-            # for recurrent branches apply many-to-one attention block
+            # for recurrent branches apply many-to-one attention block，对每一个需要加注意力机制的进行加工
             for i, enc_out in enumerate(encoder_outputs[0:]):
                 x = attention_3d_block(enc_out, dense_size=attention_size, modality='_' + data_types[i])
                 x = Dropout(0.5)(x)
                 x = Lambda(lambda x: K.expand_dims(x, axis=1))(x)
                 att_enc_out.append(x)
-            # aplly many-to-one attention block to the attended modalities
+            # aplly many-to-one attention block to the attended modalities，然后进行融合
             x = Concatenate(name='concat_modalities', axis=1)(att_enc_out)
+            # 再进行最后一遍的注意力机制
             encodings = attention_3d_block(x, dense_size=attention_size, modality='_modality')
 
             # print(encodings.shape)
@@ -5585,6 +5621,7 @@ class MASK_PCPA_4_2D(ActionPredict):
             encodings = encoder_outputs[0]
             encodings = attention_3d_block(encodings, dense_size=attention_size, modality='_modality')
 
+        # 过一遍FC就可以输出结果了
         model_output = Dense(1, activation='sigmoid',
                              name='output_dense',
                              activity_regularizer=regularizers.l2(0.001))(encodings)
