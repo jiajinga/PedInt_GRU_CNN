@@ -836,7 +836,7 @@ class ActionPredict(object):
                                                      process=process,
                                                      **data_gen_params)
 
-    # 数据集生成
+    # 数据集生成，已经经过了数据增强、预处理等步骤，最终生成模型训练所需要的输入数据，并且返回数据的参数和正负样本的数量
     def get_data(self, data_type, data_raw, model_opts):
         """
         Generates data train/test/val data
@@ -993,7 +993,7 @@ class ActionPredict(object):
                 default_params.update(learning_scheduler['plateau'])
                 callbacks.append(ReduceLROnPlateau(**default_params))
 
-            if 'checkpoint' in learning_scheduler:  # 检查点
+            if 'checkpoint' in learning_scheduler:  # 模型保存的检查点，每当验证损失有改善时保存模型
                 default_params = {'filepath': model_path, 'monitor': 'val_loss',
                                   'save_best_only': True, 'save_weights_only': False,
                                   'save_freq': 'epoch', 'verbose': 2}
@@ -1020,7 +1020,7 @@ class ActionPredict(object):
         elif optimizer.lower() == 'rmsprop':
             return RMSprop
 
-    # 模型训练函数
+    # 模型训练函数，获取数据->创建模型->训练模型->保存模型和训练历史记录
     def train(self, data_train,
               data_val,
               batch_size=2,
@@ -1044,14 +1044,14 @@ class ActionPredict(object):
             The path to the root folder of models
         """
         learning_scheduler = learning_scheduler or {}
-        # Set the path for saving models
+        # ---Set the path for saving models---
         model_folder_name = time.strftime("%d%b%Y-%Hh%Mm%Ss")
         path_params = {'save_folder': os.path.join(self.__class__.__name__, model_folder_name),
                        'save_root_folder': 'data/models/',
                        'dataset': model_opts['dataset']}
         model_path, _ = get_path(**path_params, file_name='model.h5')
 
-        # Read train data
+        # ---Read train and validation data---
         data_train = self.get_data('train', data_train, {**model_opts, 'batch_size': batch_size}) 
 
         if data_val is not None:
@@ -1059,32 +1059,34 @@ class ActionPredict(object):
             if self._generator:  # 生成器，最后似乎返回的是一个生成器对象，images，可以 yield (x,y)
                 data_val = data_val[0]
 
-        # Create model
+        # ---Create model---
         train_model = self.get_model(data_train['data_params'])
 
-        # Train the model
+        # ---Train the model, here first to configure the model---
         class_w = self.class_weights(model_opts['apply_class_weights'], data_train['count'])
         optimizer = self.get_optimizer(optimizer)(lr=lr)
         train_model.compile(loss='binary_crossentropy', optimizer=optimizer, metrics=['accuracy'])  # 双分类得改
-        # compile是 Keras 模型的编译函数，指定损失函数、优化器和评估指标等参数
-        ## reivse fit
+        # compile是 Keras 模型的编译函数，指定损失函数、优化器和评估指标等参数，设置模型状态
+        ## ---reivse fit---
         callbacks = self.get_callbacks(learning_scheduler, model_path)
 
         # data_val = data_val.batch(batch_size)
-        # 这里的 fit 是 Keras 模型的训练函数，输入训练数据、标签、批大小、迭代次数、验证数据、类别权重、回调函数等参数，返回训练历史记录
-        history = train_model.fit(x=data_train['data'][0],
+        # 这里的
+        # ---start to train---
+        history = train_model.fit(x=data_train['data'][0],  # fit 是 Keras 模型的训练函数，输入训练数据、标签、批大小、迭代次数、验证数据、类别权重、回调函数等参数，返回训练历史记录
                                   y=None if self._generator else data_train['data'][1],
-                                  batch_size=None,
+                                  batch_size=None, # 如果使用生成器，数据已经在生成器中被批处理了，所以不需要在这里再指定批大小了
                                   epochs=epochs,
                                   validation_data=data_val,
                                   class_weight=class_w,
                                   verbose=1,
                                   callbacks=callbacks)
+        # 当缺失模型保存检查点时，手动保存模型
         if 'checkpoint' not in learning_scheduler:
             print('Train model is saved to {}'.format(model_path))
             train_model.save(model_path)
 
-        # Save data options and configurations
+        # ---Save data options and configurations---
         model_opts_path, _ = get_path(**path_params, file_name='model_opts.pkl')
         with open(model_opts_path, 'wb') as fid:
             pickle.dump(model_opts, fid, pickle.HIGHEST_PROTOCOL)
@@ -1093,7 +1095,7 @@ class ActionPredict(object):
         self.log_configs(config_path, batch_size, epochs,
                          lr, model_opts)
 
-        # Save training history
+        # ---Save training history---
         history_path, saved_files_path = get_path(**path_params, file_name='history.pkl')
         with open(history_path, 'wb') as fid:
             pickle.dump(history.history, fid, pickle.HIGHEST_PROTOCOL)
@@ -1159,7 +1161,7 @@ class ActionPredict(object):
                 yaml.dump(results, fid)
         return acc, auc, f1, precision, recall
 
-    # 获取模型
+    # 获取模型，提供接口，根据数据参数生成模型，具体的模型结构由子类实现
     def get_model(self, data_params):
         """
         Generates a model
@@ -1459,7 +1461,7 @@ class SFRNN(ActionPredict):
         return net_model
 
 
-# C3D   3d CNN? 是用来完成视频理解的，与前面不同，多了个get_data的重写，或许是因为它处理的是图像数据？
+# C3D   3d CNN? 是用来完成视频理解的，处理视频数据，与前面不同，多了个get_data的重写，或许是因为它处理的是图像数据？
 class C3D(ActionPredict):
     """
     C3D code based on
@@ -1500,7 +1502,7 @@ class C3D(ActionPredict):
         model_opts['backbone'] = 'c3d'
         return super(C3D, self).get_data(data_type, data_raw, model_opts)
 
-    # TODO: use keras function to load weights
+
     def get_model(self, data_params):
         if not os.path.exists(self._weights):
             weights_url = 'https://github.com/adamcasson/c3d/releases/download/v0.1/sports1M_weights_tf.h5'
@@ -1577,7 +1579,7 @@ class I3D(ActionPredict):
         return net_model
 
 
-# 双流 I3D
+# 双流 I3D，一个流处理RGB图像，另一个流处理光流图像，最后把两个流的输出融合起来进行预测
 class TwoStreamI3D(ActionPredict):
     """
     Two-stream 3D method based on
@@ -1601,7 +1603,7 @@ class TwoStreamI3D(ActionPredict):
             weights_rgb: Pre-trained weights for rgb stream.
             weights_flow: Pre-trained weights for optical flow stream.
         """
-        super().__init__(**kwargs)
+        super().__init__(**kwargs)  # 调用父类的初始化函数，设置一些通用的参数
         # Network parameters
         self._dropout = dropout
         self._dense_activation = dense_activation
@@ -1772,7 +1774,9 @@ class TwoStreamI3D(ActionPredict):
         return acc, auc, f1, precision, recall
 
 
-# 将从最后的卷积层中获取到的特征输入到 a dense layer 来分类
+# 将从最后的卷积层中获取到的特征输入到 a dense layer 来分类，应该只是一个简单的卷积神经网络
+# 这个模型的输入是图像数据，而不是序列数据，所以它重写了 get_data 函数来处理图像数据，
+# 并且在 get_model 函数中使用了预训练的卷积神经网络（如 VGG16）来提取图像特征，然后通过一个全连接层进行分类。
 class Static(ActionPredict):
     """
     A static model which uses features from the last convolution
@@ -1810,6 +1814,8 @@ class Static(ActionPredict):
         self._conv_models = {'vgg16': vgg16.VGG16, 'resnet50': resnet50.ResNet50, 'alexnet': AlexNet}
         self._backbone = backbone
 
+    # 这个函数和前面几个模型的 get_data 函数不同，因为它处理的是图像数据，而不是序列数据。
+    # 似乎是只处理 local_box、local_context 和 scene 这三种图像特征类型
     def get_data(self, data_type, data_raw, model_opts):
         """
         Generates train/test data
@@ -2023,7 +2029,7 @@ class MASK_ConvLSTM(ActionPredict):
 
     def get_model(self, data_params):
         att_enc_out = []
-        data_size = data_params['data_sizes'][0]
+        data_size = data_params['data_sizes'][0]  # 通常是 local_context_cnn
         data_type = data_params['data_types'][0]
 
         x_in = Input(shape=data_size, name='input_' + data_type)
@@ -2037,8 +2043,8 @@ class MASK_ConvLSTM(ActionPredict):
             out = GlobalMaxPooling2D()(convlstm)
         else:
             out = Flatten(name='flatten')(convlstm)
-######  For  MASK
-        data_size = data_params['data_sizes'][1]
+        ######  For  MASK
+        data_size = data_params['data_sizes'][1]   # 通常是 mask_cnn
         data_type = data_params['data_types'][1]
 
         x_in2 = Input(shape=data_size, name='input2_' + data_type)
@@ -2053,7 +2059,7 @@ class MASK_ConvLSTM(ActionPredict):
         else:
             out2 = Flatten(name='flatten')(convlstm2)
 
-######## Later Fusion
+        ######## Later Fusion
         att_enc_out.append(out)
         att_enc_out.append(out2)
         out_final = Concatenate(name='concat_modalities', axis=1)(att_enc_out)
@@ -3416,7 +3422,9 @@ class TwoStreamFusion(ActionPredict):
         return acc, auc, f1, precision, recall
 
 
-# 注意力机制
+# 注意力机制，具体是通过计算每个时间步的隐藏状态与最后一个时间步的隐藏状态的相似度来得到注意力权重，
+# 然后将这些权重应用于所有时间步的隐藏状态来得到一个上下文向量，
+# 最后将这个上下文向量与最后一个时间步的隐藏状态连接起来并通过一个全连接层得到最终的注意力向量。
 def attention_3d_block(hidden_states, dense_size=128, modality=''):
     """
     Many-to-one attention mechanism for Keras.
@@ -5695,6 +5703,7 @@ class DataGenerator(Sequence):
         else:
             return X
 
+    # 这里是针对的已经提取好的特征，在模型训练之前进行的预处理，主要是针对3D卷积提取的特征进行全局池化或者展平等操作
     def _get_img_features(self, cached_path):
         with open(cached_path, 'rb') as fid:
             try:
@@ -5714,6 +5723,7 @@ class DataGenerator(Sequence):
                 img_features = img_features.ravel()        
         return img_features
 
+    # 生成一个batch的输入数据，针对每一个输入类型进行处理，最后返回一个list，list中每个元素是一个输入类型对应的batch数据
     def _generate_X(self, indices):
         X = []
         for input_type_idx, input_type in enumerate(self.input_type_list):
@@ -5741,6 +5751,7 @@ class DataGenerator(Sequence):
             X.append(features_batch)
         return X
 
+    # 生成一个batch的标签数据
     def _generate_y(self, indices):
         return np.array(self.labels[indices])
 
