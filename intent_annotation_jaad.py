@@ -34,7 +34,7 @@ from tqdm import tqdm
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-
+###########################
 class IntentAnalyzer:
     def __init__(self, frame_size: Tuple[int, int], motion_threshold: float = 0.2):
         """
