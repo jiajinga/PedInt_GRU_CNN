@@ -680,10 +680,12 @@ class ActionPredict(object):
                 for seq in d[k]:
                     start_idx = len(seq) - obs_length - time_to_event[1]
                     end_idx = len(seq) - obs_length - time_to_event[0]
+                    # 这里一次性提取了多个观测窗口
                     seqs.extend([seq[i:i + obs_length] for i in
                                  range(start_idx, end_idx + 1, olap_res)])
                 d[k] = seqs
 
+            # 代码分离，上面是处理数据，提取序列，下面是处理标签，提取对应的 time to event 标签
             for seq in data_raw['bbox']:
                 start_idx = len(seq) - obs_length - time_to_event[1]
                 end_idx = len(seq) - obs_length - time_to_event[0]

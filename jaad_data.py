@@ -232,7 +232,7 @@ class JAAD(object):
                    'designated': {'ND': 0, 'D': 1},
                    'gender': {'n/a': 0, 'female': 1, 'male': 2},
                    'intersection': {'no': 0, 'yes': 1},
-                   'motion_direction': {'n/a': 0, 'LAT': 1, 'LONG': 2},
+                   'motion_direction': {'n/a': 0, 'LAT': 1, 'LONG': 2}, # 这里的motion direction是相对于车辆的，LAT是横向，LONG是纵向
                    'traffic_direction': {'OW': 0, 'TW': 1},
                    'signalized': {'n/a': 0, 'NS': 1, 'S': 2},
                    'vehicle': {'stopped': 0, 'moving_slow': 1, 'moving_fast': 2,
@@ -1035,6 +1035,7 @@ class JAAD(object):
             sequence = self._get_crossing(image_set, annot_database, **params)
         elif params['seq_type'] == 'intention':
             sequence = self._get_intention(image_set, annot_database, **params)
+        # TODO: 后续可能得加一个_get_direction函数，仿照 _get_crossing写
 
         return sequence
 
@@ -1138,25 +1139,29 @@ class JAAD(object):
         num_pedestrians = 0
         seq_stride = params['fstride']
         sq_ratio = params['squarify_ratio']
-        height_rng = params['height_rng']
+        height_rng = params['height_rng']   # 意指要利用多少行人边界框的像素，无的话就设置为[0, inf]
         image_seq, pids_seq = [], []
         box_seq, center_seq, occ_seq = [], [], []
         intent_seq = []
         vehicle_seq = []
         activities = []
 
-        video_ids, _pids = self._get_data_ids(image_set, params)
+        video_ids, _pids = self._get_data_ids(image_set, params)  # 获取视频id和行人id
 
         for vid in sorted(video_ids):
             img_width = annotations[vid]['width']
             img_height = annotations[vid]['height']
             pid_annots = annotations[vid]['ped_annotations']
             vid_annots = annotations[vid]['vehicle_annotations']
+            # TODO: 这里的代码逻辑还得看一下，pid 中有 b 的表示是有行为标签的，对应 pedestrian，p 对应的是一群人，看看他是不是把 ped 给过滤出去了
             for pid in sorted(pid_annots):
+                # 这里的意思是 如果数据划分方式不是默认的，并且这个行人id不在这个划分里，就跳过这个行人
                 if params['data_split_type'] != 'default' and pid not in _pids:
                     continue
+                # 这里的意思是如果行人id里有p，即群体，就跳过这个行人
                 if 'p' in pid:
                     continue
+                # 这里的意思是如果是研究行为，但是这个行人没有行为标签，就跳过这个行人，实际上对应的就是跳过people和ped
                 if params['sample_type'] == 'beh' and 'b' not in pid:
                     continue
                 num_pedestrians += 1
@@ -1164,38 +1169,48 @@ class JAAD(object):
                 frame_ids = pid_annots[pid]['frames']
 
                 if 'b' in pid:
+                    # 事件帧
                     event_frame = pid_annots[pid]['attributes']['crossing_point']
                 else:
+                    # event_frame 设置为-1相当于处理所有
                     event_frame = -1
 
                 if event_frame == -1:
-                    end_idx = -3
+                    end_idx = -3  # 没有事件帧的话，就把最后两帧的数据都去掉，保证每条轨迹至少有两帧数据，并且事件帧不在轨迹的最后一帧
                 else:
-                   end_idx = frame_ids.index(event_frame)
+                    # 定位到事件帧在行人轨迹中的位置，后续把这个位置之前的轨迹数据都保留下来
+                    end_idx = frame_ids.index(event_frame)
                 boxes = pid_annots[pid]['bbox'][:end_idx + 1]
                 frame_ids = frame_ids[: end_idx + 1]
                 images = [self._get_image_path(vid, f) for f in frame_ids]
                 occlusions = pid_annots[pid]['occlusion'][:end_idx + 1]
 
+                # 检查高度
                 if height_rng[0] > 0 or height_rng[1] < float('inf'):
                     images, boxes, frame_ids, occlusions = self._height_check(height_rng,
                                                                               frame_ids, boxes,
                                                                               images, occlusions)
 
+                # 太短也跳过
                 if len(boxes) / seq_stride < params['min_track_size']:
                     continue
 
+                # 调整成方形
                 if sq_ratio:
                     boxes = [self._squarify(b, sq_ratio, img_width) for b in boxes]
 
+                # 按照指定频率进行采样
                 image_seq.append(images[::seq_stride])
                 box_seq.append(boxes[::seq_stride])
                 center_seq.append([self._get_center(b) for b in boxes][::seq_stride])
                 occ_seq.append(occlusions[::seq_stride])
-
+                # 同样的方式处理一下行人id
                 ped_ids = [[pid]] * len(boxes)
                 pids_seq.append(ped_ids[::seq_stride])
 
+                # 如果这个行人没有行为标签 (ped, people)，就把意图和行为都标记为0，
+                # 有行为标签 (pedestrian) 但是没有过街意图，就把意图标记为0，行为标记为1，
+                # pedestrian 有过街意图，就把意图标记为1，行为标记为1
                 if 'b' not in pid:
                     intent = [[0]] * len(boxes)
                     acts = [[0]] * len(boxes)
@@ -1206,6 +1221,7 @@ class JAAD(object):
                         intent = [[1]] * len(boxes)
                     acts = [[int(pid_annots[pid]['attributes']['crossing'] > 0)]] * len(boxes)
 
+                # 按照指定频率进行采样
                 intent_seq.append(intent[::seq_stride])
                 activities.append(acts[::seq_stride])
                 vehicle_seq.append([[vid_annots[i]]
@@ -1222,7 +1238,7 @@ class JAAD(object):
                 'occlusion': occ_seq,
                 'vehicle_act': vehicle_seq,
                 'intent': intent_seq,
-                'activities': activities,
+                'activities': activities,  # 这个是指行人是否有过街行为，和 crossing_point 这个属性是不同的，crossing_point 只要有过街意图就会被标记为1，而 activities 只有当行人真的有过街行为时才会被标记为1
                 'image_dimension': (img_width, img_height)}
 
     def _get_intention(self, image_set, annotations, **params):

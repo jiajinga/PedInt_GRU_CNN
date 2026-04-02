@@ -34,7 +34,7 @@ from tqdm import tqdm
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-###########################
+
 class IntentAnalyzer:
     def __init__(self, frame_size: Tuple[int, int], motion_threshold: float = 0.2):
         """
@@ -63,10 +63,12 @@ class IntentAnalyzer:
 
     def update_track_history(self, track_id: int, centroid: Tuple[int, int]):
         """Update tracking history for a specific track ID"""
+        # 所以每次应该都只传入一个值
         if track_id not in self.track_histories:
             self.track_histories[track_id] = []
         self.track_histories[track_id].append(centroid)
 
+    # 将画面一分为三，判断目标与自车之间的关系
     def determine_position(self, centroid: Tuple[int, int]) -> str:
         """Determine object position relative to ego vehicle"""
         if centroid[0] < self.position_threshold:
@@ -80,11 +82,12 @@ class IntentAnalyzer:
         Determine vertical and lateral intent based on track history and camera motion.
         Returns [lateral_intent, vertical_intent]
         """
-        history = list(self.track_histories.get(track_id, []))
+        history = list(self.track_histories.get(track_id, []))  # 行人轨迹来源
         if len(history) < 3:
             return ["stationary", "stationary"]
 
         # If camera motion is available, subtract it from object centroids
+        # 这个条件判定为什么会有 false 啊，正常情况下 camera_motion > history 应该是恒成立吧
         if self.camera_motion and len(self.camera_motion) >= len(history) and False:
             rel_history = [
                 (obj[0] - cam[0], obj[1] - cam[1])
@@ -159,12 +162,13 @@ def get_centroid(box: List[int]) -> Tuple[int, int]:
     x1, y1, x2, y2 = box
     return (int((x1 + x2) / 2), int((y1 + y2) / 2))
 
-# 用光流法估计相机运动
+# 用光流法估计相邻两帧之间的相机运动
 def estimate_camera_motion(frame1: np.ndarray, frame2: np.ndarray) -> Tuple[float, float]:
     """
     Estimate camera motion between two frames using optical flow.
     Returns the average motion vector (dx, dy).
     """
+
     # Convert frames to grayscale
     gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
@@ -197,7 +201,7 @@ def estimate_camera_motion(frame1: np.ndarray, frame2: np.ndarray) -> Tuple[floa
             median_motion = np.median(motion_vectors, axis=0)
             return median_motion[0], median_motion[1]
 
-    return 0, 0
+    return 0, 0     # 如果没有足够的特征点或计算失败，返回零运动
 
 # 计算从开始到最后的位移
 def calculate_displacement(points: List[Tuple[float, float]]) -> Tuple[float, Tuple[float, float], Tuple[float, float], float, float]:
@@ -310,15 +314,15 @@ def process_video(video_url: str, intent_analyzer: IntentAnalyzer,
     cyclist_memory = {}  # Store cyclist detection history
 
     # Process each frame
-    while cap.isOpened():
-        ret, frame = cap.read()
+    while cap.isOpened():  # 合着你就一个视频吗
+        ret, frame = cap.read()  # ret 是一个布尔值，表示是否成功读取了视频帧；frame 是读取到的帧图像
         if not ret:
             break
 
         # Estimate camera motion if we have a previous frame
         if prev_frame is not None:
             dx, dy = estimate_camera_motion(prev_frame, frame)
-            camera_motion.append((dx, dy))
+            camera_motion.append((dx, dy))  # 那感觉这个条件根本就进不来啊，
         prev_frame = frame.copy()
 
         # Run YOLOv8 tracking for persons
@@ -329,11 +333,13 @@ def process_video(video_url: str, intent_analyzer: IntentAnalyzer,
 
         person_detections = []
         if results[0].boxes.id is not None:
+            # 提取边界框和行人ID序列
             boxes = results[0].boxes.xywh.cpu()
             track_ids = results[0].boxes.id.int().cpu().tolist()
 
             # Convert boxes to xyxy format for person detections
             for box, track_id in zip(boxes, track_ids):
+                # 边界框格式转换
                 x, y, w, h = box
                 xyxy = [x-w/2, y-h/2, x+w/2, y+h/2]
                 person_detections.append((xyxy, track_id))
@@ -343,6 +349,7 @@ def process_video(video_url: str, intent_analyzer: IntentAnalyzer,
                 if box_area < 0.001 * frame_area or box_area > 0.9 * frame_area:
                     continue
 
+                # 那就相当于目前这个 track_histories 都是行人的轨迹，这可能是一个初步处理
                 if track_id not in track_histories:
                     track_histories[track_id] = {
                         'boxes': [],
@@ -359,8 +366,9 @@ def process_video(video_url: str, intent_analyzer: IntentAnalyzer,
                 cv2.circle(frame, (int(x), int(y)), 4, (0, 255, 0), -1)
                 cv2.putText(frame, f'ID: {track_id}', (int(x), int(y) - 10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # 这两句是用来在视频帧上绘制行人检测结果的，首先在行人中心位置画一个绿色圆点，然后在圆点上方显示该行人的ID信息。这样可以直观地看到每个行人的位置和对应的跟踪ID。
 
-        # Update cyclist tracks
+        # Update cyclist tracks，行人处理完之后，添加自行车手的轨迹
         track_histories = update_cyclist_tracks(track_histories, frame_count,
                                               person_detections, cycle_boxes,
                                               cyclist_memory)
@@ -377,14 +385,14 @@ def process_video(video_url: str, intent_analyzer: IntentAnalyzer,
     cap.release()
     os.remove(video_path)
 
-    # Add camera motion to the return dictionary
+    # Add camera motion to the return dictionary，接着添加相机的运动轨迹
     track_histories['camera'] = {
         'centroids': [(0, 0)],
         'frame_nums': [0],
         'class': 'Camera'
     }
 
-    # Accumulate camera motion
+    # Accumulate camera motion，将相机运动累积起来，得到每一帧相对于第一帧的相机位置，这样在后续分析行人意图时就可以考虑相机的运动对行人位置的影响。
     cam_x, cam_y = 0, 0
     for i, (dx, dy) in enumerate(camera_motion, 1):
         cam_x += dx
@@ -392,7 +400,8 @@ def process_video(video_url: str, intent_analyzer: IntentAnalyzer,
         track_histories['camera']['centroids'].append((cam_x, cam_y))
         track_histories['camera']['frame_nums'].append(i)
 
-    # Link broken tracks
+    # Link broken tracks，继续更新轨迹信息，所以最后感觉这个就像是完整的行人轨迹
+    # 对于每一个行人ID，下面都有个字典，里面包含边界框、中心、帧数
     track_histories = link_broken_tracks(track_histories,
                                        max_frame_gap=15,
                                        max_spatial_dist=100.0)
@@ -678,7 +687,8 @@ def get_median_optical_flow(video_path, point, box_h = 150,  max_frames=100, y_s
 def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output_dir: str, output_json: str, diff_keys = None):
     """Process entire dataset and save results"""
 
-    # Load dataset, 换成自己的
+    # Load dataset
+    # TODO: 换成自己的，这里可能是设置为文件夹路径？
     dataset = load_json_data(dataset_filepath)
     original_dataset = load_json_data(original_dataset_filepath)
     # Create output directory
@@ -688,7 +698,8 @@ def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output
     output_data = {}
     flag = 1
     count = 0
-    for sample_id, sample_data in tqdm(islice(dataset.items(), 50), desc="Processing samples", total=50):  # tqdm是个啥，看不懂，先放这
+    # TODO: 这个tqdm看不懂
+    for sample_id, sample_data in tqdm(islice(dataset.items(), 50), desc="Processing samples", total=50):
         
         # Copy original data
         output_data[sample_id] = sample_data.copy()
@@ -705,7 +716,7 @@ def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output
             continue
 
         # Process pedestrian annotations，这里好像是提取行人的标签，如果是行人且运动方向不为N/A或空，就把它的边界框和意图添加到输出数据中
-        # 但是一开始的数据集不是本来就没有这些东西吗？
+        # TODO: 但是一开始的数据集不是本来就没有这些东西吗？
         if (original_dataset[annotation_index].get('Agent-classifier') == 'Pedestrian' and
             original_dataset[annotation_index].get('pedestrian_motion_direction') not in ["N/A", []]):
             output_data[sample_id]['Pedestrians'][str(len(sample_data['Pedestrians']) + 1)] = {
@@ -723,17 +734,20 @@ def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output
 
         try:
             # Get video dimensions from first frame
+            # TODO: 路径硬编码，这里设置的是 file_folder，后面应该想办法让它循环这个文件夹下面的视频文件，或者直接在上面那个 dataset 里把视频路径也加上
             video_path = "JAAD/JAAD_clips"
             # animate_optical_flow(video_path)
-            cap = cv2.VideoCapture(video_path)
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            cap = cv2.VideoCapture(video_path)    # 这里捕获的是单个视频文件
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))   # 获取视频的宽度和高度
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            cap.release()
+            cap.release()   # 释放资源
 
-            # Initialize intent analyzer with more sensitive threshold
+            # Initialize intent analyzer with more sensitive threshold，初始化，这个motion_threshold是用来判断对象是否在移动的阈值，越小越敏感
+            # TODO: 看一下IntentAnalyzer类 and set_camera_motion
             intent_analyzer = IntentAnalyzer(frame_size=(width, height), motion_threshold=0.15)
 
             # Track objects in video and get their histories
+            # TODO: 看一下process_video函数
             track_histories = process_video(output_data[sample_id]['video_path'], intent_analyzer)
 
             # Set camera motion in intent analyzer
@@ -743,12 +757,16 @@ def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output
             # Plot 3D tracks for this sample
             plot_3d_tracks(track_histories, f"Object Tracks - Sample {sample_id}")
             matched_tracks = {}
+
             # Process each object type separately
             for object_type in ['Pedestrians', 'Cyclists']:
+                # so, if the current object type is not in the output data for this sample,
+                # we skip it and move on to the next type. This is a way to ensure
+                # that we only try to match and analyze objects that are actually present in the data for this sample.
                 if object_type not in output_data[sample_id]:
                     continue
 
-                # Get tracked objects of this type
+                # Get tracked objects of this type, 这一部分都是来处理轨迹跟踪的
                 type_tracks = {k: v for k, v in track_histories.items()
                              if v['class'] == object_type}
                 if not type_tracks:
@@ -767,7 +785,7 @@ def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output
                 for track_idx, obj_id in matches.items():
                     track_id = track_idx
                     track_data = type_tracks[track_id]
-                    matched_tracks[track_id] = track_data
+                    matched_tracks[track_id] = track_data   # 这个变量不是一点都没用上吗？
 
                     # Update track history for intent analysis
                     for i, centroid in enumerate(track_data['centroids']):
