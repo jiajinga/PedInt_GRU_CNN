@@ -29,6 +29,7 @@ import torch
 import torchvision
 from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
 from torchvision.transforms import functional as F
+from multiprocessing import Pool, cpu_count
 
 # Check for GPU availability
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -36,122 +37,7 @@ print(f"Using device: {device}")
 
 # Initialize models
 yolo_model = YOLO('yolov8x.pt')
-cycle_model = fasterrcnn_resnet50_fpn_v2(pretrained=True)
-cycle_model = cycle_model.to(device)
-cycle_model.eval()
 
-# TODO: 删
-def detect_cycles(frame: np.ndarray, confidence_threshold: float = 0.5) -> List[List[float]]:
-    """
-    Detect cycles using Faster R-CNN
-    Returns list of [x1, y1, x2, y2, confidence] for each detection
-    """
-    # Convert frame to tensor and move to GPU if available
-    image = F.to_tensor(frame).unsqueeze(0)
-    image = image.to(device)
-
-    with torch.no_grad():
-        prediction = cycle_model(image)
-
-    # Extract bicycle detections (class 2 in COCO)
-    boxes = []
-    for box, label, score in zip(prediction[0]['boxes'],
-                                prediction[0]['labels'],
-                                prediction[0]['scores']):
-        if label == 2 and score > confidence_threshold:  # bicycle class
-            x1, y1, x2, y2 = box.cpu().numpy()
-            boxes.append([x1, y1, x2, y2, float(score)])
-
-    return boxes
-
-# TODO: 删
-def check_cyclist_association(person_box: List[float],
-                            cycle_box: List[float],
-                            max_vertical_offset: float = 160.0,
-                            min_vertical_offset: float = 0.0,
-                            min_overlap_ratio: float = 0.3) -> bool:
-    """
-    Check if person and cycle detections likely form a cyclist using centroids
-    """
-    # Unpack boxes
-    px1, py1, px2, py2 = person_box[:4]
-    cx1, cy1, cx2, cy2 = cycle_box[:4]
-
-    # Calculate centroids and box heights
-    person_centroid_y = (py1 + py2) / 2
-    cycle_centroid_y = (cy1 + cy2) / 2
-    person_height = py2 - py1
-    cycle_height = cy2 - cy1
-
-    # Check vertical alignment (person above cycle)
-    vertical_offset = person_centroid_y - cycle_centroid_y
-
-    # Adjust max offset based on object sizes
-    adjusted_max_offset = max(max_vertical_offset, (person_height + cycle_height) / 2)
-
-    # Person should be above cycle (negative offset) but not too far
-    # Also ensure minimum separation to avoid false positives
-    if not (-adjusted_max_offset <= vertical_offset):
-        return False
-
-    # Check horizontal overlap
-    overlap_x1 = max(px1, cx1)
-    overlap_x2 = min(px2, cx2)
-
-    if overlap_x2 <= overlap_x1:
-        return False
-
-    # Calculate overlap ratio
-    overlap_width = overlap_x2 - overlap_x1
-    person_width = px2 - px1
-    cycle_width = cx2 - cx1
-    overlap_ratio = overlap_width / min(person_width, cycle_width)
-    return overlap_ratio >= min_overlap_ratio
-
-# TODO: 删
-def update_cyclist_tracks(track_histories: Dict[int, Dict],
-                         current_frame: int,
-                         person_detections: List[Tuple[List[float], int]],
-                         cycle_detections: List[List[float]],
-                         cyclist_memory: Dict[int, Dict]) -> Dict[int, Dict]:
-    """
-    Update tracking with cyclist combinations
-    """
-    # Update cyclist memory with new associations
-    for person_box, person_id in person_detections:
-        for cycle_box in cycle_detections:
-            if check_cyclist_association(person_box, cycle_box):
-                if person_id not in cyclist_memory:
-                    cyclist_memory[person_id] = {
-                        'frames_as_cyclist': 0,
-                        'last_cycle_box': cycle_box,
-                        'confirmed': False
-                    }
-
-                cyclist_memory[person_id]['frames_as_cyclist'] += 1
-                cyclist_memory[person_id]['last_cycle_box'] = cycle_box
-
-                # Confirm as cyclist after consistent detection
-                if cyclist_memory[person_id]['frames_as_cyclist'] >= 5:
-                    cyclist_memory[person_id]['confirmed'] = True
-                    if person_id in track_histories:
-                        track_histories[person_id]['class'] = 'Cyclists'
-                break
-
-    # Remove old entries and unconfirm if no recent associations
-    to_remove = []
-    for person_id in cyclist_memory:
-        if person_id not in [pid for _, pid in person_detections]:
-            cyclist_memory[person_id]['frames_as_cyclist'] -= 1
-            if cyclist_memory[person_id]['frames_as_cyclist'] <= 0:
-                to_remove.append(person_id)
-                if person_id in track_histories and track_histories[person_id]['class'] == 'Cyclists':
-                    track_histories[person_id]['class'] = 'Pedestrians'
-
-    for person_id in to_remove:
-        del cyclist_memory[person_id]
-
-    return track_histories
 
 class IntentAnalyzer:
     def __init__(self, frame_size: Tuple[int, int], motion_threshold: float = 0.2):
@@ -570,7 +456,6 @@ def process_video(video_num: str, intent_analyzer: IntentAnalyzer,
     camera_motion = []   # Store camera motion vectors
     prev_frame = None
     frame_count = 0
-    cyclist_memory = {}  # Store cyclist detection history
 
     # Process each frame
     while cap.isOpened():
@@ -586,9 +471,6 @@ def process_video(video_num: str, intent_analyzer: IntentAnalyzer,
 
         # Run YOLOv8 tracking for persons
         results = yolo_model.track(frame, persist=True, conf=conf_threshold, classes=[0], verbose=False, tracker="botsort.yaml")  # person class only
-
-        # Get cycle detections
-        cycle_boxes = detect_cycles(frame)
 
         person_detections = []
         if results[0].boxes.id is not None:
@@ -622,16 +504,6 @@ def process_video(video_num: str, intent_analyzer: IntentAnalyzer,
                 cv2.circle(frame, (int(x), int(y)), 4, (0, 255, 0), -1)
                 cv2.putText(frame, f'ID: {track_id}', (int(x), int(y) - 10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-        # Update cyclist tracks
-        track_histories = update_cyclist_tracks(track_histories, frame_count,
-                                              person_detections, cycle_boxes,
-                                              cyclist_memory)
-
-        # Draw cycle detections
-        for box in cycle_boxes:
-            x1, y1, x2, y2, conf = box
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
 
         # Display frame
         # display_frame_with_grid(frame)
@@ -684,6 +556,7 @@ def process_video(video_num: str, intent_analyzer: IntentAnalyzer,
     return track_histories
 
 # 这个函数用于在视频帧上绘制网格和坐标，帮助可视化对象位置和运动轨迹
+# TODO: 可视化或许能用到
 def display_frame_with_grid(frame: np.ndarray):
     """
     Display the frame with a grid and x, y coordinates using cv2_imshow.
@@ -741,6 +614,7 @@ def best_iou_batch(track_boxes: np.ndarray, input_box: np.ndarray) -> float:
     ious = inter / (track_areas + input_area - inter + 1e-8)
     return float(np.max(ious))
 
+# 匹配跟踪对象和输入框，使用匈牙利算法进行全局最优匹配，并根据IoU阈值过滤匹配结果
 def match_objects(type_tracks, input_boxes, iou_thresh=0.3):
     if not type_tracks or not input_boxes:
         return {}
@@ -778,7 +652,7 @@ def match_objects(type_tracks, input_boxes, iou_thresh=0.3):
 
     return matches
 
-
+# TODO: 没有用到，考虑删
 def find_best_match(tracked_box: List[int], input_boxes: Dict[str, Dict]) -> Optional[str]:
     """Find the best matching input box for a tracked box"""
     best_iou = 0.3  # Lower threshold for matching
@@ -842,6 +716,7 @@ def remove_duplicate_boxes(input_boxes: Dict[str, Dict], iou_threshold: float = 
 from matplotlib import animation
 
 # 这个函数使用光流法计算视频帧之间的运动，并创建一个动画来可视化这些运动。它可以帮助我们理解视频中对象的动态行为。
+# TODO: 或许可以用于可视化检查结果
 def animate_optical_flow(video_path, max_frames=100, step=1):
     cap = cv2.VideoCapture(video_path)
 
@@ -1090,9 +965,11 @@ def get_median_optical_flow(video_path, point, box_h = 150,  max_frames=100, y_s
 # 这个函数应该是完整的数据处理流程
 def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output_dir: str, output_json: str, diff_keys = None):
     """Process entire dataset and save results"""
+
     # Load dataset
-    dataset = load_json_data(dataset_filepath)
-    original_dataset = load_json_data(original_dataset_filepath)
+    # TODO: 修改路径，你那个还是文件夹，下面再是具体的视频文件
+    dataset = load_json_data(dataset_filepath)  # 视频
+    original_dataset = load_json_data(original_dataset_filepath)  # 标注
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1100,12 +977,15 @@ def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output
     output_data = {}
     flag = 1
     count = 0
+    # 这里是处理前50个样本，并且加进度条 (tqdm)
+    # TODO: 这里的50是为了测试，正式运行时要改成 len(dataset)
     for sample_id, sample_data in tqdm(islice(dataset.items(), 50), desc="Processing samples", total=50):
         
         # Copy original data
         output_data[sample_id] = sample_data.copy()
 
         # Find corresponding annotation
+        # TODO: 修改为自己的标注
         annotation_index = next(
             (i for i, ann in enumerate(original_dataset)
              if ann.get('s3_fileUrl') == sample_data['image_path']),
@@ -1117,6 +997,7 @@ def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output
             continue
 
         # Process pedestrian annotations
+        # TODO: 但是一开始的数据集不是本来就没有这些东西吗？这个可能是适配DRAMA数据集的
         if (original_dataset[annotation_index].get('Agent-classifier') == 'Pedestrian' and
             original_dataset[annotation_index].get('pedestrian_motion_direction') not in ["N/A", []]):
             output_data[sample_id]['Pedestrians'][str(len(sample_data['Pedestrians']) + 1)] = {
@@ -1125,14 +1006,17 @@ def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output
             }
 
         # Process cyclist annotations
+        # TODO: 删
         if (original_dataset[annotation_index].get('Agent-classifier') == 'Cyclist' and
             original_dataset[annotation_index].get('pedestrian_motion_direction') not in ["N/A", []]):
             output_data[sample_id]['Cyclists'][str(len(sample_data['Cyclists']) + 1)] = {
                 "Box": convert_bbox_format(original_dataset[annotation_index].get('geometry')),
                 "Intent": original_dataset[annotation_index].get('pedestrian_motion_direction')[0]
             }
+
         try:
             # Get video dimensions from first frame
+            # TODO: 我们应该是已知画幅的，无需这样麻烦
             video_path = download_video(output_data[sample_id]['video_path'])
             # animate_optical_flow(video_path)
             cap = cv2.VideoCapture(video_path)
@@ -1143,18 +1027,20 @@ def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output
             # Initialize intent analyzer with more sensitive threshold
             intent_analyzer = IntentAnalyzer(frame_size=(width, height), motion_threshold=0.15)
 
-            # Track objects in video and get their histories
+            # Track objects in video and get their histories，这里应该是相当于获取初始轨迹
             track_histories = process_video(output_data[sample_id]['video_path'], intent_analyzer)
 
             # Set camera motion in intent analyzer
             if 'camera' in track_histories:
                 intent_analyzer.set_camera_motion(track_histories['camera']['centroids'])
 
-            # Plot 3D tracks for this sample
+            # Plot 3D tracks for this sample，这是在 for 循环里的啊
             plot_3d_tracks(track_histories, f"Object Tracks - Sample {sample_id}")
             matched_tracks = {}
             # Process each object type separately
+            # TODO: 删除这个循环
             for object_type in ['Pedestrians', 'Cyclists']:
+                # TODO: 删
                 if object_type not in output_data[sample_id]:
                     continue
 
@@ -1165,6 +1051,7 @@ def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output
                     continue
 
                 # Get final boxes for matching
+                # TODO: 这两个又没有用到，考虑删除
                 track_ids = list(type_tracks.keys())
                 tracked_boxes = [track_data['boxes'][-1] for track_data in type_tracks.values()]
 
@@ -1182,6 +1069,7 @@ def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output
                     # Update track history for intent analysis
                     for i, centroid in enumerate(track_data['centroids']):
                         if i == 0:
+                            # Get camera motion
                             cam_dx, cam_dy = get_median_optical_flow(video_path, (centroid[0], centroid[1]))
 
                             iter = 0
@@ -1191,7 +1079,6 @@ def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output
                               if iter > 10:
                                 cam_dx, cam_dy = 0, 0
                                 break
-                        # Get camera motion
 
                         intent_analyzer.update_track_history(track_id, centroid)
 
@@ -1216,11 +1103,6 @@ def process_dataset(dataset_filepath: str, original_dataset_filepath:str, output
     # Save results
     save_json_data(output_data, output_json)
 
-import os
-import cv2
-from multiprocessing import Pool, cpu_count
-from itertools import islice
-from tqdm import tqdm
 
 # 这个函数是上一个函数的并行版本，使用 multiprocessing 库来加速处理整个数据集。它将每个样本的处理任务分配给多个进程，以提高效率。
 def process_dataset_parallel(dataset_filepath: str, original_dataset_filepath: str, output_dir: str, output_json: str):
