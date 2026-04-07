@@ -15,7 +15,7 @@ This code should be run in an environment with access to the YOLOv8 model.
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Any
 import argparse
 from tqdm import tqdm
 import json
@@ -33,7 +33,7 @@ import torchvision
 from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
 from torchvision.transforms import functional as F
 from multiprocessing import Pool, cpu_count
-import xml.etree.ElementTree as ET   # 用于解析、编辑 XML 文件
+import xml.etree.ElementTree as ET  # 用于解析、编辑 XML 文件
 
 # Check for GPU availability
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -58,7 +58,7 @@ class IntentAnalyzer:
         self.track_histories = {}  # Store centroid history for each track
         # TODO: 为什么要进行缩放？
         self.scale_factor = 0.5  # Video frames are half size of reference
-        self.camera_motion = []   # Store camera centroids for each frame
+        self.camera_motion = []  # Store camera centroids for each frame
 
     def set_camera_motion(self, camera_centroids: list):
         """
@@ -85,6 +85,7 @@ class IntentAnalyzer:
             return "Right of ego vehicle"
         return "Front of ego vehicle"
 
+    # TODO: 这个函数实际上使用的时候是直接用行人整体轨迹的首位位移差减去相机的运动
     def determine_intent(self, track_id: int, cam_dx, cam_dy) -> List[str]:
         """
         Determine vertical and lateral intent based on track history and camera motion.
@@ -107,17 +108,16 @@ class IntentAnalyzer:
         net_dx = rel_history[-1][0] - rel_history[0][0]
         net_dy = rel_history[-1][1] - rel_history[0][1]
 
-
         # Calculate motion over multiple windows to catch subtle movements
-        windows = [(0, len(rel_history)//2), (len(rel_history)//2, len(rel_history))]
+        windows = [(0, len(rel_history) // 2), (len(rel_history) // 2, len(rel_history))]
         dx_values = []
         dy_values = []
         for start, end in windows:
             if end - start < 2:
                 continue
             window = rel_history[start:end]
-            dx = [window[i+1][0] - window[i][0] for i in range(len(window)-1)]
-            dy = [window[i+1][1] - window[i][1] for i in range(len(window)-1)]
+            dx = [window[i + 1][0] - window[i][0] for i in range(len(window) - 1)]
+            dy = [window[i + 1][1] - window[i][1] for i in range(len(window) - 1)]
             dx_values.extend(dx)
             dy_values.extend(dy)
         if not dx_values or not dy_values:
@@ -152,14 +152,6 @@ class IntentAnalyzer:
         return f"Lateral: {lateral}, Vertical: {vertical}"
 
 
-# TODO: 改数据集加载方式，将对应使用该方法的地方更换为新的，然后删除
-def load_json_data(file_path: str) -> dict:
-    """Load JSON data from file"""
-    print(f"Loading JSON data from {file_path}")
-    with open(file_path, 'r') as f:
-        return json.load(f)
-
-
 def build_dataset(video_root, anno_root):
     """数据集加载方式，适配 PIE，获取了系列 ID 视频路径 标注路径"""
     samples = {}
@@ -188,33 +180,179 @@ def build_dataset(video_root, anno_root):
     return samples
 
 
-def save_xml_annotation(anno_path, output_root, **args):
+def parse_pedestrians(anno_path: str) -> Dict[str, Dict[str, Any]]:
+    """
+    从标注 XML 文件中提取所有 pedestrian 轨迹。
+
+    Args:
+        anno_path: XML 文件路径
+
+    Returns:
+        字典，键为行人 id，值为包含以下字段的字典：
+            - "boxes": numpy 数组，形状 (N, 4)，每行为 [xtl, ytl, xbr, ybr]
+            - "frame_nums": list，对应每一帧的 frame 编号
+    """
+    tree = ET.parse(anno_path)
+    root = tree.getroot()
+    pedestrians = {}
+
+    for track in root.findall('track'):
+        if track.get('label') != 'pedestrian':
+            continue
+
+        boxes_data = []
+        frames = []
+
+        for box in track.findall('box'):
+            # 获取 frame 和坐标
+            frame = int(box.get('frame'))
+            xtl = float(box.get('xtl'))
+            ytl = float(box.get('ytl'))
+            xbr = float(box.get('xbr'))
+            ybr = float(box.get('ybr'))
+            boxes_data.append([xtl, ytl, xbr, ybr])
+            frames.append(frame)
+
+        # 获取 id（通常第一个 box 的 attribute 中包含）
+        first_box = track.find('box')
+        if first_box is None:
+            continue
+        id_attr = first_box.find('attribute[@name="id"]')
+        if id_attr is None:
+            continue
+        ped_id = id_attr.text
+
+        pedestrians[ped_id] = {
+            "boxes": boxes_data,
+            "frame_nums": frames
+        }
+
+    return pedestrians
+
+
+def save_xml_annotation(anno_path, output_root, track_histories, matches):
     """向标注文件中添加新的行人及方向意图"""
 
     # 解析 XML 文件
     tree = ET.parse(anno_path)
     root = tree.getroot()
 
-    '''
-    # 创建新的 object 元素
-    obj = ET.SubElement(root, 'object')
-    ET.SubElement(obj, 'name').text = 'Pedestrian'
-    ET.SubElement(obj, 'pose').text = 'Unspecified'
-    ET.SubElement(obj, 'truncated').text = '0'
-    ET.SubElement(obj, 'difficult').text = '0'
+    # 先取出来已经匹配的意图
+    match_intent = {v: track_histories[k]['dir_intent'] for k, v in matches.items()}
 
-    # 添加意图信息
-    intent_info = (f"Lateral Intent: {args.get('lateral_intent', 'unknown')}, "
-                   f"Vertical Intent: {args.get('vertical_intent', 'unknown')}")
-    ET.SubElement(obj, 'intent').text = intent_info
-    '''
+    id_max = 0
+    ped_id = None
+
+    # 对匹配好了的轨迹添加 dir_intent
+    for track in root.findall('track'):
+        if track.get('label') != 'pedestrian':
+            continue
+
+        for box in track.findall('box'):
+            # 获取该 box 对应的行人 id
+            id_attr = box.find("attribute[@name='id']")
+            if id_attr is None:
+                continue
+            ped_id = id_attr.text
+
+            if ped_id not in match_intent:
+                continue
+
+            # 检查是否已存在 dir_intent 属性，若存在则先移除（避免重复）
+            existing = box.find("attribute[@name='dir_intent']")
+            if existing is not None:
+                box.remove(existing)
+
+            # 添加新属性
+            attr = ET.SubElement(box, 'attribute')
+            attr.set('name', 'dir_intent')
+            attr.text = ', '.join(match_intent[ped_id])
+
+        id_max = int(ped_id.split('_')[-1]) if int(ped_id.split('_')[-1]) > id_max else id_max
+
+    set_num, v_num = ped_id.split('_')[0], ped_id.split('_')[1]
+    # 接着创建未匹配的轨迹的标注
+    for track_id, track_data in track_histories.items():
+        boxes = track_data.get('boxes')
+        frame_nums = track_data.get('frame_nums')
+        dir_intent = track_data.get('dir_intent')
+
+        if not boxes or not frame_nums or len(boxes) != len(frame_nums) or track_id in matches:
+            print(f"Warning: track_id {track_id} has mismatched boxes and frame_nums or has been matched, skipping")
+            continue
+
+        id_max += 1
+        new_id = '_'.join([set_num, v_num, str(id_max)])
+
+        # 创建 track 元素
+        track_elem = ET.SubElement(root, 'track')
+        track_elem.set('label', 'pedestrian')
+
+        # 为每一帧添加 box
+        for frame, box_coords in zip(frame_nums, boxes):
+            if len(box_coords) != 4:
+                print(f"Warning: track_id {track_id} has invalid box coordinates: {box_coords}")
+                continue
+
+            xtl, ytl, xbr, ybr = box_coords
+
+            # 创建 box 元素
+            box_elem = ET.SubElement(track_elem, 'box')
+            box_elem.set('frame', str(frame))
+            box_elem.set('keyframe', '0')
+            box_elem.set('occluded', '0')
+            box_elem.set('outside', '0')
+            box_elem.set('xbr', f"{xbr:.2f}")
+            box_elem.set('xtl', f"{xtl:.2f}")
+            box_elem.set('ybr', f"{ybr:.2f}")
+            box_elem.set('ytl', f"{ytl:.2f}")
+
+            # 添加 attribute 元素
+            # id
+            id_attr = ET.SubElement(box_elem, 'attribute')
+            id_attr.set('name', 'id')
+            id_attr.text = new_id
+
+            # gesture (默认 __undefined__)
+            gesture_attr = ET.SubElement(box_elem, 'attribute')
+            gesture_attr.set('name', 'gesture')
+            gesture_attr.text = '__undefined__'
+
+            # action (默认 standing)
+            action_attr = ET.SubElement(box_elem, 'attribute')
+            action_attr.set('name', 'action')
+            action_attr.text = 'standing'
+
+            # cross (默认 not-crossing)
+            cross_attr = ET.SubElement(box_elem, 'attribute')
+            cross_attr.set('name', 'cross')
+            cross_attr.text = 'not-crossing'
+
+            # look (默认 not-looking)
+            look_attr = ET.SubElement(box_elem, 'attribute')
+            look_attr.set('name', 'look')
+            look_attr.text = 'not-looking'
+
+            # occlusion (默认 none)
+            occlusion_attr = ET.SubElement(box_elem, 'attribute')
+            occlusion_attr.set('name', 'occlusion')
+            occlusion_attr.text = 'none'
+
+            # dir_intent
+            dir_intent_attr = ET.SubElement(box_elem, 'attribute')
+            dir_intent_attr.set('name', 'dir_intent')
+            dir_intent_attr.text = ', '.join(dir_intent)
 
     # 生成保存路径，创建输出目录
-    output_path = os.path.join(output_root, anno_path.split(os.sep)[-2], anno_path.split(os.sep)[-1])
+    anno_path_normalized = os.path.normpath(anno_path)  # 为了避免分割出错
+    output_path = os.path.join(output_root, anno_path_normalized.split(os.sep)[-2],
+                               anno_path_normalized.split(os.sep)[-1])
     os.makedirs(os.path.join(output_root, anno_path.split(os.sep)[-2]), exist_ok=True)
 
     # 保存修改后的 XML 文件
     tree.write(output_path)
+    print(f"new annotations have been saved to {output_path}")
+
 
 # 用光流法估计相机运动
 def estimate_camera_motion(frame1: np.ndarray, frame2: np.ndarray) -> Tuple[float, float]:
@@ -228,9 +366,9 @@ def estimate_camera_motion(frame1: np.ndarray, frame2: np.ndarray) -> Tuple[floa
 
     # Calculate optical flow using Lucas-Kanade method
     feature_params = dict(maxCorners=100,
-                         qualityLevel=0.3,
-                         minDistance=7,
-                         blockSize=7)
+                          qualityLevel=0.3,
+                          minDistance=7,
+                          blockSize=7)
 
     p0 = cv2.goodFeaturesToTrack(gray1, mask=None, **feature_params)
     if p0 is None:
@@ -244,8 +382,8 @@ def estimate_camera_motion(frame1: np.ndarray, frame2: np.ndarray) -> Tuple[floa
 
     # Select good points
     if p1 is not None:
-        good_new = p1[st==1]
-        good_old = p0[st==1]
+        good_new = p1[st == 1]
+        good_old = p0[st == 1]
 
         # Calculate motion vectors
         motion_vectors = good_new - good_old
@@ -255,6 +393,7 @@ def estimate_camera_motion(frame1: np.ndarray, frame2: np.ndarray) -> Tuple[floa
             return median_motion[0], median_motion[1]
 
     return 0, 0
+
 
 # 预测未来位置，考虑最近的运动趋势和加速度，并返回一个置信度分数，在 should_merge_tracks 中使用
 def predict_next_position(track: Dict, num_frames: int = 1) -> Tuple[np.ndarray, float]:
@@ -296,9 +435,10 @@ def predict_next_position(track: Dict, num_frames: int = 1) -> Tuple[np.ndarray,
 
     return predicted_pos, confidence
 
+
 # TODO: 这个没有用到，考虑删掉，或者改成在 should_merge_tracks 中使用，作为一个额外的特征来判断两个轨迹是否应该合并
 def calculate_appearance_similarity(frame1: np.ndarray, frame2: np.ndarray,
-                                 box1: List[float], box2: List[float]) -> float:
+                                    box1: List[float], box2: List[float]) -> float:
     """
     Calculate appearance similarity between two object patches
     """
@@ -330,10 +470,11 @@ def calculate_appearance_similarity(frame1: np.ndarray, frame2: np.ndarray,
     except:
         return 0.0
 
+
 # 评判两个轨迹是否应该合并，考虑时间间隔、空间距离、运动一致性和外观相似度等多个因素
 def should_merge_tracks(track1: Dict, track2: Dict,
-                       max_frame_gap: int = 15,
-                       max_spatial_dist: float = 100.0) -> bool:
+                        max_frame_gap: int = 15,
+                        max_spatial_dist: float = 100.0) -> bool:
     """
     Determine if two tracks should be merged based on multiple metrics
     """
@@ -390,6 +531,7 @@ def should_merge_tracks(track1: Dict, track2: Dict,
 
     return final_score > threshold
 
+
 def merge_tracks(track1: Dict, track2: Dict) -> Dict:
     """
     Merge two track histories into one.
@@ -402,9 +544,10 @@ def merge_tracks(track1: Dict, track2: Dict) -> Dict:
         'class': track1['class']  # They should be the same class
     }
 
+
 def link_broken_tracks(track_histories: Dict[int, Dict],
-                      max_frame_gap: int = 15,
-                      max_spatial_dist: float = 100.0) -> Dict[int, Dict]:
+                       max_frame_gap: int = 15,
+                       max_spatial_dist: float = 100.0) -> Dict[int, Dict]:
     """
     Link tracks that likely belong to the same object.
 
@@ -425,8 +568,7 @@ def link_broken_tracks(track_histories: Dict[int, Dict],
 
     # Sort tracks by start frame，按照每个 id 轨迹出现的起始帧时间进行排序，不过是改变了 id 的顺序，并没有改变每个 id 轨迹内部的时间顺序
     sorted_tracks = sorted(track_histories.items(),
-                         key=lambda x: x[1]['frame_nums'][0])
-
+                           key=lambda x: x[1]['frame_nums'][0])
 
     merged_tracks = {}
     used_tracks = set()
@@ -441,7 +583,7 @@ def link_broken_tracks(track_histories: Dict[int, Dict],
         used_tracks.add(track_id1)
 
         # Look for tracks to merge with current_track
-        for track_id2, track2 in sorted_tracks[i+1:]:
+        for track_id2, track2 in sorted_tracks[i + 1:]:
             if track_id2 in used_tracks:
                 continue
 
@@ -459,9 +601,10 @@ def link_broken_tracks(track_histories: Dict[int, Dict],
 
     return merged_tracks
 
+
 # 这个函数是整个流程的核心，处理视频帧，跟踪对象，分析意图，并返回跟踪历史
 def process_video(video_path: str, intent_analyzer: IntentAnalyzer,
-                 conf_threshold: float = 0.25) -> Dict[int, Dict]:
+                  conf_threshold: float = 0.25) -> Dict[int, Dict]:
     """
     Process video to track objects and analyze their intent
     Returns dictionary mapping object IDs to their tracking histories
@@ -475,13 +618,13 @@ def process_video(video_path: str, intent_analyzer: IntentAnalyzer,
     frame_area = width * height
 
     track_histories = {}  # Store tracking histories
-    camera_motion = []   # Store camera motion vectors
+    camera_motion = []  # Store camera motion vectors
     prev_frame = None
     frame_count = 0
 
     # Process each frame
     while cap.isOpened():
-        ret, frame = cap.read()   # ret 就是标志视频有没有损坏或者是读完，frame 就是读取的这一帧
+        ret, frame = cap.read()  # ret 就是标志视频有没有损坏或者是读完，frame 就是读取的这一帧
         if not ret:
             break
 
@@ -498,17 +641,18 @@ def process_video(video_path: str, intent_analyzer: IntentAnalyzer,
         results = yolo_model.track(frame, persist=True, conf=conf_threshold, classes=[0], verbose=False,
                                    tracker="botsort.yaml")  # person class only
 
-        person_detections = []  # 看起来每一帧都会重置
-        if results[0].boxes.id is not None:   # 检测到行人
+        # person_detections = []  # 看起来每一帧都会重置
+        if results[0].boxes.id is not None:  # 如果在这一帧中检测到行人
             boxes = results[0].boxes.xywh.cpu()
             track_ids = results[0].boxes.id.int().cpu().tolist()
 
-            # Convert boxes to xyxy format for person detections
+            # 对于每一帧检测到的所有边界框和跟踪id
             for box, track_id in zip(boxes, track_ids):
-                # 处理边界框
+
+                # Convert boxes to xyxy format for person detections
                 x, y, w, h = box
-                xyxy = [x-w/2, y-h/2, x+w/2, y+h/2]
-                person_detections.append((xyxy, track_id))
+                xyxy = [x - w / 2, y - h / 2, x + w / 2, y + h / 2]  # 在图像中，y轴坐标是向下的，PIE 使用的也是这样的计算方法
+                # person_detections.append((xyxy, track_id))
 
                 # Filter out unrealistic detections，过滤异常框
                 box_area = w * h
@@ -524,7 +668,7 @@ def process_video(video_path: str, intent_analyzer: IntentAnalyzer,
                         'class': 'Pedestrians'
                     }
 
-                # TODO: 这里的 track_id 是直接从 yolov8 里面获取到的，不一定和咱们最后要标注的一致
+                # TODO: 这里的 track_id 是直接从 yolov8 里面获取到的，不一定和咱们最后要标注的一致。另外这里的track_histories格式也要进行一定的修改
                 track_histories[track_id]['boxes'].append(xyxy)
                 track_histories[track_id]['centroids'].append((float(x), float(y)))
                 track_histories[track_id]['frame_nums'].append(frame_count)
@@ -532,7 +676,7 @@ def process_video(video_path: str, intent_analyzer: IntentAnalyzer,
                 # Draw centroid on frame
                 cv2.circle(frame, (int(x), int(y)), 4, (0, 255, 0), -1)
                 cv2.putText(frame, f'ID: {track_id}', (int(x), int(y) - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 cv2.imshow('Pedestrian Tracking', frame)  # 显示画面
                 if cv2.waitKey(1) & 0xFF == ord('q'):  # 按 Q 退出
                     break  # 退出循环
@@ -561,8 +705,8 @@ def process_video(video_path: str, intent_analyzer: IntentAnalyzer,
 
     # Link broken tracks
     track_histories = link_broken_tracks(track_histories,
-                                       max_frame_gap=15,
-                                       max_spatial_dist=100.0)
+                                         max_frame_gap=15,
+                                         max_spatial_dist=100.0)
 
     # Calculate and print displacements
     # 算出来的这个位移有传出去吗？起到一个什么作用呢？可能只是打印检查
@@ -586,6 +730,7 @@ def process_video(video_path: str, intent_analyzer: IntentAnalyzer,
     # 处理完一个视频后重置跟踪器，避免 ID 混乱
     yolo_model.predictor.trackers[0].reset()
     return track_histories
+
 
 # 这个函数用于在视频帧上绘制网格和坐标，帮助可视化对象位置和运动轨迹
 # TODO: 可视化或许能用到
@@ -615,37 +760,41 @@ def display_frame_with_grid(frame: np.ndarray):
     # Display the frame with the grid
     # cv2_imshow(frame)
 
+
 # 这个函数实现了一个简单的贪心匹配算法，用于在成本矩阵中找到最佳匹配对，作为匈牙利算法的备选方案
 def greedy_match(cost_matrix, track_ids, input_ids):
     # Flatten and sort (i,j) pairs by cost
-    flat = [(i,j,c) for i,row in enumerate(cost_matrix)
-                 for j,c in enumerate(row)]
+    flat = [(i, j, c) for i, row in enumerate(cost_matrix)
+            for j, c in enumerate(row)]
     flat.sort(key=lambda x: x[2])
     matches, used_t, used_i = {}, set(), set()
-    for i,j,c in flat:
+    for i, j, c in flat:
         if i not in used_t and j not in used_i:
             matches[track_ids[i]] = input_ids[j]
-            used_t.add(i); used_i.add(j)
+            used_t.add(i);
+            used_i.add(j)
     return matches
+
 
 # 计算输入框与跟踪框的最佳IoU，用于匹配对象。这对应的是原文中获取到全部数据后和 ground truth 进行匹配，以补全
 # TODO: 这个用于计算最大 IoU 的函数估计也得改，因为 input_box 可能不是一个静态框，而是一个轨迹，或许是一个 (N,4) 的数组
 def best_iou_batch(track_boxes: np.ndarray, input_box: np.ndarray) -> float:
     # track_boxes: (M,4), input_box: (4,)
-    x1 = np.maximum(track_boxes[:,0], input_box[0])
-    y1 = np.maximum(track_boxes[:,1], input_box[1])
-    x2 = np.minimum(track_boxes[:,2], input_box[2])
-    y2 = np.minimum(track_boxes[:,3], input_box[3])
+    x1 = np.maximum(track_boxes[:, 0], input_box[0])
+    y1 = np.maximum(track_boxes[:, 1], input_box[1])
+    x2 = np.minimum(track_boxes[:, 2], input_box[2])
+    y2 = np.minimum(track_boxes[:, 3], input_box[3])
 
     inter_w = np.clip(x2 - x1, 0, None)
     inter_h = np.clip(y2 - y1, 0, None)
     inter = inter_w * inter_h
 
-    track_areas = (track_boxes[:,2] - track_boxes[:,0]) * (track_boxes[:,3] - track_boxes[:,1])
+    track_areas = (track_boxes[:, 2] - track_boxes[:, 0]) * (track_boxes[:, 3] - track_boxes[:, 1])
     input_area = (input_box[2] - input_box[0]) * (input_box[3] - input_box[1])
 
     ious = inter / (track_areas + input_area - inter + 1e-8)
     return float(np.max(ious))
+
 
 # 匹配跟踪对象和输入框，使用匈牙利算法进行全局最优匹配，并根据IoU阈值过滤匹配结果
 # TODO: 这个匹配函数需要修改
@@ -657,7 +806,7 @@ def match_objects(type_tracks, input_boxes, iou_thresh=0.3):
     for bid, bdata in input_boxes.items():
         # 为啥要除以2？可能是因为对方输入框的坐标是按照原始视频尺寸给出的，而跟踪框的坐标是按照处理后的视频尺寸给出的，
         # 所以需要将输入框的坐标缩放到相同的尺度上进行匹配。
-        input_list.append(np.array(bdata['Box'])/2)
+        input_list.append(np.array(bdata['Box']) / 2)
         input_ids.append(bid)
     track_ids = list(type_tracks)
     cost = np.zeros((len(track_ids), len(input_list)), dtype=float)
@@ -667,28 +816,29 @@ def match_objects(type_tracks, input_boxes, iou_thresh=0.3):
         tb = np.array(type_tracks[tid]['boxes'])  # (M,4)
         for j, ib in enumerate(input_list):
             best = best_iou_batch(tb, ib)
-            cost[i,j] = 1 - best
+            cost[i, j] = 1 - best
 
     # if only one candidate, shortcut
     if cost.size == 1:
-        return { track_ids[0]: input_ids[0] }
+        return {track_ids[0]: input_ids[0]}
 
     # Hungarian with fallback
     try:
         # 使用 匈牙利算法 求解二分图的最小权完美匹配，如果行数 > 列数，则会为每个列进行匹配，最后返回的长度应该是列的大小
-        r,c = linear_sum_assignment(cost)
-        pairs = list(zip(r,c))
+        r, c = linear_sum_assignment(cost)
+        pairs = list(zip(r, c))
     except ValueError:
         pairs = greedy_match(cost, track_ids, input_ids).items()
 
     # filter by IoU threshold，对于匹配上的再使用 iou_thresh 过滤一遍
     # TODO: 看来这里返回的应该是只有匹配成功的，我们需要考虑多出来的
     matches = {}
-    for i,j in pairs:
-        if cost[i,j] < 1 - iou_thresh:
+    for i, j in pairs:
+        if cost[i, j] < 1 - iou_thresh:
             matches[track_ids[i]] = input_ids[j]  # 返回的是个字典，键是 track_histories 的 id，值是 input_id
 
     return matches
+
 
 # TODO: 没有用到，考虑删
 def find_best_match(tracked_box: List[int], input_boxes: Dict[str, Dict]) -> Optional[str]:
@@ -704,13 +854,16 @@ def find_best_match(tracked_box: List[int], input_boxes: Dict[str, Dict]) -> Opt
 
     return best_id
 
+
 def convert_bbox_format(bbox):
     """Convert bounding box format if needed"""
     x1, y1 = bbox[0]
     x2, y2 = bbox[2]
     return [x1, y1, x2, y2]
 
+
 from matplotlib import animation
+
 
 # 这个函数使用光流法计算视频帧之间的运动，并创建一个动画来可视化这些运动。它可以帮助我们理解视频中对象的动态行为。
 # TODO: 或许可以用于可视化检查结果
@@ -766,8 +919,11 @@ def animate_optical_flow(video_path, max_frames=100, step=1):
     ani = animation.FuncAnimation(fig, update, frames=len(frames), interval=50, blit=True)
     # display(HTML(ani.to_jshtml()))
 
+
 # 这个函数计算在不同边距下的光流，并返回所有边距的中位数。它可以帮助我们理解在不同空间范围内对象的运动趋势。
-def get_median_optical_flow_multiple_margins(video_path, point, box_size=(50, 150), margins=[50, 70,  100, 120, 150, 170, 200, 50], max_frames=100, y_shift = False, margin_add = 0):
+def get_median_optical_flow_multiple_margins(video_path, point, box_size=(50, 150),
+                                             margins=[50, 70, 100, 120, 150, 170, 200, 50], max_frames=100,
+                                             y_shift=False, margin_add=0):
     """
     For each margin, sums per-pixel flow across frames in adjacent box, then computes the median dx, dy.
 
@@ -832,7 +988,7 @@ def get_median_optical_flow_multiple_margins(video_path, point, box_size=(50, 15
                                                 0.5, 3, 15, 3, 5, 1.2, 0)
 
             # Extract and accumulate flow in the box
-            flow_box = flow[box_y:box_y+bh, box_x:box_x+bw]
+            flow_box = flow[box_y:box_y + bh, box_x:box_x + bw]
             flow_sum += flow_box
 
             prev_gray = gray
@@ -859,8 +1015,9 @@ def get_median_optical_flow_multiple_margins(video_path, point, box_size=(50, 15
     print(f"\n→ Overall Median dx = {overall_median_dx:.2f}, dy = {overall_median_dy:.2f}")
     return overall_median_dx, overall_median_dy
 
+
 # 这个函数是上一个函数的简化版本，只计算一个边距下的光流中位数。它可以作为快速评估对象运动趋势的工具。
-def get_median_optical_flow(video_path, point, box_h = 150,  max_frames=100, y_shift = False):
+def get_median_optical_flow(video_path, point, box_h=150, max_frames=100, y_shift=False):
     """
     For each margin, sums per-pixel flow across frames in adjacent box, then computes the median dx, dy.
 
@@ -913,7 +1070,7 @@ def get_median_optical_flow(video_path, point, box_h = 150,  max_frames=100, y_s
                                             0.5, 3, 15, 3, 5, 1.2, 0)
 
         # Extract and accumulate flow in the box
-        flow_box = flow[box_y:box_y+bh, box_x:box_x+bw]
+        flow_box = flow[box_y:box_y + bh, box_x:box_x + bw]
         flow_sum += flow_box
 
         prev_gray = gray
@@ -960,7 +1117,8 @@ def get_median_optical_flow(video_path, point, box_h = 150,  max_frames=100, y_s
 
 
 # 这个函数应该是完整的数据处理流程
-def process_dataset(video_root: str, anno_root: str, dataset_filepath: str, original_dataset_filepath:str, output_dir: str, output_json: str, diff_keys = None):
+def process_dataset(video_root: str, anno_root: str, dataset_filepath: str, original_dataset_filepath: str,
+                    output_dir: str, output_json: str, diff_keys=None):
     """Process entire dataset and save results"""
 
     # 加载路径
@@ -982,9 +1140,8 @@ def process_dataset(video_root: str, anno_root: str, dataset_filepath: str, orig
         video_path = sample_data['video_path']
         anno_path = sample_data['anno_path']
 
-        # Copy original data，后面将这个变量当作 input_boxes 来用，进行匹配，最后在这个基础上添加意图分析的结果，保存到 output_data 里面
-        # TODO: 考虑修改，换成复制原来的 annotation，然后添加修改结果，放在另外一个文件夹里面
-        output_data[sample_id] = sample_data.copy()
+        # 获取 PIE 数据集中已经标注好的行人 id, boxes, frame_nums，最终目的是服务于匹配
+        output_data[sample_id] = parse_pedestrians(anno_path)
 
         # Get video dimensions from first frame
         # animate_optical_flow(video_path)
@@ -997,6 +1154,8 @@ def process_dataset(video_root: str, anno_root: str, dataset_filepath: str, orig
         # Track objects in video and get their histories，这里应该是相当于获取行人和相机的轨迹，行人轨迹已经合并了，并且生成的是新的id
         track_histories = process_video(video_path, intent_analyzer)
 
+        # TODO: 对 track_histories 过滤
+
         # Set camera motion in intent analyzer，只是单纯赋了个值
         if 'camera' in track_histories:
             intent_analyzer.set_camera_motion(track_histories['camera']['centroids'])
@@ -1008,12 +1167,9 @@ def process_dataset(video_root: str, anno_root: str, dataset_filepath: str, orig
         matches = match_objects(track_histories, output_data)
 
         # TODO: 这里的处理方式还是按照匹配好了的来，需要添加未匹配的行人轨迹处理，输出似乎也没有包括轨迹边界框
-        matched_tracks = {}
         # Process matches
-        for track_idx, obj_id in matches.items():
-            track_id = track_idx
+        for track_id in track_histories.keys():
             track_data = track_histories[track_id]
-            matched_tracks[track_id] = track_data
 
             # Update track history for intent analysis
             for i, centroid in enumerate(track_data['centroids']):
@@ -1024,37 +1180,23 @@ def process_dataset(video_root: str, anno_root: str, dataset_filepath: str, orig
                     iter = 0
                     while cam_dy < 0:
                         cam_dx, cam_dy = get_median_optical_flow_multiple_margins(video_path,
-                                                                                (centroid[0], centroid[1]),
-                                                                                y_shift=True,
-                                                                                margin_add=iter * 5)
+                                                                                  (centroid[0], centroid[1]),
+                                                                                  y_shift=True,
+                                                                                  margin_add=iter * 5)
                         iter += 1
                         if iter > 10:
                             cam_dx, cam_dy = 0, 0
                             break
 
+                # 这个就是简单赋值
                 intent_analyzer.update_track_history(track_id, centroid)
 
-            # Analyze intent
-            intent = intent_analyzer.determine_intent(track_id, cam_dx, cam_dy)
-            position = intent_analyzer.determine_position(track_data['centroids'][-1])
+            # 这里输出的是 [lateral intent, vertical intent]
+            track_histories[track_id]['dir_intent'] = intent_analyzer.determine_intent(track_id, cam_dx, cam_dy)
 
-            # Update output data
-            # TODO: 删除之前的数据保存方式
-            output_data[sample_id][object_type][obj_id].update({
-                'Intent': intent,
-                'Position': position,
-                'Description': intent_analyzer.generate_description(intent)
-            })
-
-            save_xml_annotation(anno_path, output_dir, {'Intent':intent, 'Position': position, 'Description': intent_analyzer.generate_description(intent)})
+        # 对方输出的description或许我并不需要
+        save_xml_annotation(anno_path, output_dir, track_histories, matches)
         count += 1
-
-
-        if count % 100 == 0:
-          print(f"Processed {count} samples")
-          save_json_data(output_data, output_json)
-    # Save results
-    save_json_data(output_data, output_json)
 
 
 # 这个函数是上一个函数的并行版本，使用 multiprocessing 库来加速处理整个数据集。它将每个样本的处理任务分配给多个进程，以提高效率。
@@ -1074,10 +1216,8 @@ def process_dataset_parallel(dataset_filepath: str, original_dataset_filepath: s
     def worker(item):
         sample_id, sample_data = item
 
-        
-
         # Copy original data
-        local_output = { sample_id: sample_data.copy() }
+        local_output = {sample_id: sample_data.copy()}
 
         # Find corresponding annotation
         annotation_index = next(
@@ -1091,7 +1231,7 @@ def process_dataset_parallel(dataset_filepath: str, original_dataset_filepath: s
 
         # Process pedestrian annotations
         if (original_dataset[annotation_index].get('Agent-classifier') == 'Pedestrian' and
-            original_dataset[annotation_index].get('pedestrian_motion_direction') not in ["N/A", []]):
+                original_dataset[annotation_index].get('pedestrian_motion_direction') not in ["N/A", []]):
             local_output[sample_id]['Pedestrians'][str(len(sample_data['Pedestrians']) + 1)] = {
                 "Box": convert_bbox_format(original_dataset[annotation_index].get('geometry')),
                 "Intent": original_dataset[annotation_index].get('pedestrian_motion_direction')[0]
@@ -1099,7 +1239,7 @@ def process_dataset_parallel(dataset_filepath: str, original_dataset_filepath: s
 
         # Process cyclist annotations
         if (original_dataset[annotation_index].get('Agent-classifier') == 'Cyclist' and
-            original_dataset[annotation_index].get('pedestrian_motion_direction') not in ["N/A", []]):
+                original_dataset[annotation_index].get('pedestrian_motion_direction') not in ["N/A", []]):
             local_output[sample_id]['Cyclists'][str(len(sample_data['Cyclists']) + 1)] = {
                 "Box": convert_bbox_format(original_dataset[annotation_index].get('geometry')),
                 "Intent": original_dataset[annotation_index].get('pedestrian_motion_direction')[0]
@@ -1163,7 +1303,7 @@ def process_dataset_parallel(dataset_filepath: str, original_dataset_filepath: s
                                     video_path,
                                     (centroid[0], centroid[1]),
                                     y_shift=True,
-                                    margin_add=iter*5
+                                    margin_add=iter * 5
                                 )
                                 iter += 1
                                 if iter > 10:
@@ -1189,7 +1329,6 @@ def process_dataset_parallel(dataset_filepath: str, original_dataset_filepath: s
         except Exception as e:
             print(f"Error processing sample {sample_id}: {str(e)}")
             print(sample_data)
-            
 
     # Execute in parallel
     with Pool(processes=cpu_count()) as pool:
@@ -1205,7 +1344,6 @@ def process_dataset_parallel(dataset_filepath: str, original_dataset_filepath: s
 
     # Save final results
     save_json_data(output_data, output_json)
-
 
 
 def box_iou(box1: List[int], box2: List[int]) -> float:
@@ -1228,6 +1366,7 @@ def box_iou(box1: List[int], box2: List[int]) -> float:
 
     return inter / union if union > 0 else 0
 
+
 def plot_3d_tracks(track_histories: Dict[int, Dict], title: str = "Object Tracks in 3D"):
     """
     Create a 3D plot of object tracks with time as the third dimension.
@@ -1245,9 +1384,9 @@ def plot_3d_tracks(track_histories: Dict[int, Dict], title: str = "Object Tracks
         camera_points = np.array(camera_data['centroids'])
         if len(camera_points) > 1:
             ax.plot(camera_points[:, 0], camera_points[:, 1],
-                   camera_data['frame_nums'],  # Use actual frame numbers
-                   c='red', linewidth=2, label='Camera Motion',
-                   linestyle='--')
+                    camera_data['frame_nums'],  # Use actual frame numbers
+                    c='red', linewidth=2, label='Camera Motion',
+                    linestyle='--')
 
     # Then plot object tracks
     colors = plt.cm.rainbow(np.linspace(0, 1, len(track_histories)))
@@ -1265,7 +1404,7 @@ def plot_3d_tracks(track_histories: Dict[int, Dict], title: str = "Object Tracks
 
         # Plot the track
         ax.plot(xs, ys, frame_nums, c=color,
-               label=f'Track {track_id} ({track_data["class"]}) [F{frame_nums[0]}-{frame_nums[-1]}]')
+                label=f'Track {track_id} ({track_data["class"]}) [F{frame_nums[0]}-{frame_nums[-1]}]')
         # Plot start point
         ax.scatter(xs[0], ys[0], frame_nums[0], c=color, marker='o')
         # Plot end point
@@ -1279,26 +1418,29 @@ def plot_3d_tracks(track_histories: Dict[int, Dict], title: str = "Object Tracks
     plt.tight_layout()
     plt.show()
 
+
 def main():
     parser = argparse.ArgumentParser(description='Track persons and analyze their intent in videos')
     parser.add_argument('--dataset_filepath', type=str, required=True,
-                      help='Path to the input JSON file containing video URLs')
+                        help='Path to the input JSON file containing video URLs')
     parser.add_argument('--original_dataset_filepath', type=str, required=True,
-                      help='Path to the original DRAMA dataset JSON file containing video URLs')
+                        help='Path to the original DRAMA dataset JSON file containing video URLs')
     parser.add_argument('--output_dir', type=str, required=True,
-                      help='Directory for output videos')
+                        help='Directory for output videos')
     parser.add_argument('--output_json', type=str, required=True,
-                      help='Path for output JSON with tracking and intent data')
+                        help='Path for output JSON with tracking and intent data')
     parser.add_argument('--conf', type=float, default=0.25,
-                      help='Confidence threshold for detections')
+                        help='Confidence threshold for detections')
     parser.add_argument('--parallel', type=bool, default=False,
-                      help='True for multithreading')
+                        help='True for multithreading')
 
     args = parser.parse_args()
     if args.parallel:
-      process_dataset_parallel(args.dataset_filepath, args.original_dataset_filepath, args.output_dir, args.output_json)
+        process_dataset_parallel(args.dataset_filepath, args.original_dataset_filepath, args.output_dir,
+                                 args.output_json)
     else:
-      process_dataset(args.dataset_filepath, args.original_dataset_filepath, args.output_dir, args.output_json )
+        process_dataset(args.dataset_filepath, args.original_dataset_filepath, args.output_dir, args.output_json)
+
 
 if __name__ == "__main__":
     main()
