@@ -56,8 +56,6 @@ class IntentAnalyzer:
         self.position_threshold = frame_size[0] / 3  # Center line for left/right position
         self.motion_threshold = motion_threshold
         self.track_histories = {}  # Store centroid history for each track
-        # TODO: 为什么要进行缩放？
-        self.scale_factor = 0.5  # Video frames are half size of reference
         self.camera_motion = []  # Store camera centroids for each frame
 
     def set_camera_motion(self, camera_centroids: list):
@@ -65,10 +63,6 @@ class IntentAnalyzer:
         Set the camera centroids for the video (should be called before intent analysis)
         """
         self.camera_motion = camera_centroids
-
-    def scale_bbox(self, bbox: List[int]) -> List[int]:
-        """Scale bounding box coordinates to match video frame size"""
-        return [int(coord * self.scale_factor) for coord in bbox]
 
     def update_track_history(self, track_id: int, centroid: Tuple[int, int]):
         """Update tracking history for a specific track ID"""
@@ -771,52 +765,65 @@ def greedy_match(cost_matrix, track_ids, input_ids):
     for i, j, c in flat:
         if i not in used_t and j not in used_i:
             matches[track_ids[i]] = input_ids[j]
-            used_t.add(i);
+            used_t.add(i)
             used_i.add(j)
     return matches
 
 
-# 计算输入框与跟踪框的最佳IoU，用于匹配对象。这对应的是原文中获取到全部数据后和 ground truth 进行匹配，以补全
-# TODO: 这个用于计算最大 IoU 的函数估计也得改，因为 input_box 可能不是一个静态框，而是一个轨迹，或许是一个 (N,4) 的数组
-def best_iou_batch(track_boxes: np.ndarray, input_box: np.ndarray) -> float:
-    # track_boxes: (M,4), input_box: (4,)
-    x1 = np.maximum(track_boxes[:, 0], input_box[0])
-    y1 = np.maximum(track_boxes[:, 1], input_box[1])
-    x2 = np.minimum(track_boxes[:, 2], input_box[2])
-    y2 = np.minimum(track_boxes[:, 3], input_box[3])
+def box_iou(box1: List, box2: List) -> float:
+    """计算两个框的 IoU """
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
 
     inter_w = np.clip(x2 - x1, 0, None)
     inter_h = np.clip(y2 - y1, 0, None)
     inter = inter_w * inter_h
 
-    track_areas = (track_boxes[:, 2] - track_boxes[:, 0]) * (track_boxes[:, 3] - track_boxes[:, 1])
-    input_area = (input_box[2] - input_box[0]) * (input_box[3] - input_box[1])
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
 
-    ious = inter / (track_areas + input_area - inter + 1e-8)
-    return float(np.max(ious))
+    iou = inter / (area1 + area2 - inter + 1e-8)
+    return iou
+
+
+def compute_tube_iou(track, input, min_overlap_frames=5):
+    """计算两个轨迹在共同帧内的平均 IoU。如果重叠帧数太少，直接返回 0。"""
+    # 建立帧到框的映射
+    track_dict = dict(zip(track['frame_nums'], track['boxes']))
+    input_dict = dict(zip(input['frame_nums'], input['boxes']))
+
+    # 找到它们共同存在的帧
+    common_frames = set(input['frame_nums']).intersection(set(track['frame_nums']))
+
+    # 如果重叠时间太短（比如连 5 帧都不到），认为不匹配，排除假阳性
+    if len(common_frames) < min_overlap_frames:
+        return 0.0
+
+    iou_sum = 0.0
+    for f in common_frames:
+        # 获取同一帧下，两者 box IoU
+        iou_sum += box_iou(track_dict[f], input_dict[f])
+
+    # 返回重叠区间内的平均 IoU
+    return iou_sum / len(common_frames)
 
 
 # 匹配跟踪对象和输入框，使用匈牙利算法进行全局最优匹配，并根据IoU阈值过滤匹配结果
-# TODO: 这个匹配函数需要修改
-def match_objects(type_tracks, input_boxes, iou_thresh=0.3):
-    if not type_tracks or not input_boxes:
+def match_objects(tracks, input, iou_thresh=0.3, min_overlap_frames=5):
+    if not tracks or not input:
         return {}
+    track_ids = list(tracks.keys())
+    input_ids = list(input.keys())
     # prepare data
-    input_list, input_ids = [], []
-    for bid, bdata in input_boxes.items():
-        # 为啥要除以2？可能是因为对方输入框的坐标是按照原始视频尺寸给出的，而跟踪框的坐标是按照处理后的视频尺寸给出的，
-        # 所以需要将输入框的坐标缩放到相同的尺度上进行匹配。
-        input_list.append(np.array(bdata['Box']) / 2)
-        input_ids.append(bid)
-    track_ids = list(type_tracks)
-    cost = np.zeros((len(track_ids), len(input_list)), dtype=float)
+    cost = np.zeros((len(tracks), len(input)), dtype=float)  # 字典的长度实际上就是键的长度
 
     # build cost matrix
     for i, tid in enumerate(track_ids):
-        tb = np.array(type_tracks[tid]['boxes'])  # (M,4)
-        for j, ib in enumerate(input_list):
-            best = best_iou_batch(tb, ib)
-            cost[i, j] = 1 - best
+        for j, ib in enumerate(input_ids):
+            avg_iou = compute_tube_iou(tracks[tid], input[ib], min_overlap_frames)
+            cost[i, j] = 1 - avg_iou
 
     # if only one candidate, shortcut
     if cost.size == 1:
@@ -831,28 +838,12 @@ def match_objects(type_tracks, input_boxes, iou_thresh=0.3):
         pairs = greedy_match(cost, track_ids, input_ids).items()
 
     # filter by IoU threshold，对于匹配上的再使用 iou_thresh 过滤一遍
-    # TODO: 看来这里返回的应该是只有匹配成功的，我们需要考虑多出来的
     matches = {}
     for i, j in pairs:
         if cost[i, j] < 1 - iou_thresh:
             matches[track_ids[i]] = input_ids[j]  # 返回的是个字典，键是 track_histories 的 id，值是 input_id
 
     return matches
-
-
-# TODO: 没有用到，考虑删
-def find_best_match(tracked_box: List[int], input_boxes: Dict[str, Dict]) -> Optional[str]:
-    """Find the best matching input box for a tracked box"""
-    best_iou = 0.3  # Lower threshold for matching
-    best_id = None
-
-    for obj_id, obj_data in input_boxes.items():
-        iou = box_iou(tracked_box, obj_data['Box'])
-        if iou > best_iou:
-            best_iou = iou
-            best_id = obj_id
-
-    return best_id
 
 
 def convert_bbox_format(bbox):
@@ -1141,7 +1132,7 @@ def process_dataset(video_root: str, anno_root: str, dataset_filepath: str, orig
         anno_path = sample_data['anno_path']
 
         # 获取 PIE 数据集中已经标注好的行人 id, boxes, frame_nums，最终目的是服务于匹配
-        output_data[sample_id] = parse_pedestrians(anno_path)
+        output_data = parse_pedestrians(anno_path)
 
         # Get video dimensions from first frame
         # animate_optical_flow(video_path)
@@ -1166,10 +1157,8 @@ def process_dataset(video_root: str, anno_root: str, dataset_filepath: str, orig
         # Match objects using Hungarian algorithm
         matches = match_objects(track_histories, output_data)
 
-        # TODO: 这里的处理方式还是按照匹配好了的来，需要添加未匹配的行人轨迹处理，输出似乎也没有包括轨迹边界框
-        # Process matches
-        for track_id in track_histories.keys():
-            track_data = track_histories[track_id]
+        # Process direction intention
+        for track_id, track_data in track_histories.items():
 
             # Update track history for intent analysis
             for i, centroid in enumerate(track_data['centroids']):
