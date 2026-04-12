@@ -28,16 +28,16 @@ import xml.etree.ElementTree as ET  # 用于解析、编辑 XML 文件
 import json
 
 # Check for GPU availability
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+#device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#print(f"Using device: {device}")
 
 # Initialize models
-yolo_model = YOLO('yolov8s.pt')
+#yolo_model = YOLO('yolov8s.pt')
 
 
 # ---------------------- 输入输出模块 --------------------------
-def build_dataset(video_root, anno_root):
-    """数据集加载方式，适配 PIE，获取了系列 ID 视频路径 标注路径"""
+def build_dataset(video_root, anno_root, vehicle_root):
+    """数据集加载方式，适配 PIE，获取了系列 ID 视频路径 标注路径 车辆标注路径"""
     samples = {}
     sample_id = []
 
@@ -60,6 +60,17 @@ def build_dataset(video_root, anno_root):
             sample_id = set_id + anno_name.split(".")[0][8:10]
             anno_path = os.path.join(set_path, anno_name)
             samples[sample_id]["anno_path"] = anno_path
+
+    for set_name in sorted(os.listdir(vehicle_root)):
+        set_id = set_name[-1] + "_"
+        set_path = os.path.join(vehicle_root, set_name)
+
+        for v_name in sorted(os.listdir(set_path)):
+            if not v_name.endswith(".xml"):
+                continue
+            sample_id = set_id + v_name.split(".")[0][8:10]
+            v_path = os.path.join(set_path, v_name)
+            samples[sample_id]["vehicle_path"] = v_path
 
     return samples
 
@@ -112,6 +123,32 @@ def parse_pedestrians(anno_path: str) -> Dict[str, Dict[str, Any]]:
         }
 
     return pedestrians
+
+
+def parse_vehicle(vehicle_path: str) -> Dict[int, Dict[str, float]]:
+    """
+    从标注 XML 文件中提取所有 vehicle 运动信息
+
+    Args:
+        vehicle_path: XML 文件路径
+
+    Returns:
+        字典，键为帧，值包含以下字段：
+            - "GPS_speed", "OBD_speed", "latitude", "longitude", "heading_angle"
+    """
+    tree = ET.parse(vehicle_path)
+    root = tree.getroot()
+    vehicle = {}
+
+    for track in root.findall('frame'):
+        vehicle[int(track.get('id'))] = {
+            "GPS_speed": float(track.get('GPS_speed', 0.0)),
+            "OBD_speed": float(track.get('OBD_speed', 0.0)),
+            "latitude": float(track.get('latitude', 0.0)),
+            "longitude": float(track.get('longitude', 0.0)),
+            "heading_angle": float(track.get('heading_angle', 0.0))}
+
+    return vehicle
 
 
 def save_xml_annotation(anno_path, output_root, track_histories, matches):
@@ -267,7 +304,7 @@ def save_results_to_json(results, output_json_path):
 
 
 def load_json(file_path):
-    with open(file_path, 'r') as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -440,9 +477,6 @@ def link_broken_tracks(track_histories: Dict[int, Dict],
     if len(track_histories.keys()) == 1:
         return track_histories
 
-    # Remove camera from consideration
-    camera_track = track_histories.pop('camera', None)
-
     # Sort tracks by start frame，按照每个 id 轨迹出现的起始帧时间进行排序，不过是改变了 id 的顺序，并没有改变每个 id 轨迹内部的时间顺序
     sorted_tracks = sorted(track_histories.items(),
                            key=lambda x: x[1]['frame_nums'][0])
@@ -473,8 +507,6 @@ def link_broken_tracks(track_histories: Dict[int, Dict],
         next_track_id += 1
 
     # Add back camera track if it existed
-    if camera_track:
-        merged_tracks['camera'] = camera_track
 
     return merged_tracks
 
@@ -482,7 +514,9 @@ def link_broken_tracks(track_histories: Dict[int, Dict],
 # -------------------- 模块整合（检测、追踪、连接、过滤） -----------------------
 # 这个函数是整个流程的核心，处理视频帧，跟踪对象，分析意图，并返回跟踪历史
 # 最短的 GT 跟踪轨迹时长是31帧
-def process_video(video_path: str, conf_threshold: float = 0.25, time_thresh: int = 30) -> Dict[int, Dict]:
+def process_video(video_path: str,
+                  conf_threshold: float = 0.25,
+                  time_thresh: int = 30) -> (Dict[int, Dict], Dict[int, List]):
     """
     Process video to track objects and analyze their intent
     Returns dictionary mapping object IDs to their tracking histories
@@ -496,8 +530,6 @@ def process_video(video_path: str, conf_threshold: float = 0.25, time_thresh: in
     frame_area = width * height
 
     track_histories = {}  # Store tracking histories
-    camera_motion = []  # Store camera motion vectors
-    prev_frame = None
     frame_count = 0
 
     # Process each frame
@@ -506,38 +538,21 @@ def process_video(video_path: str, conf_threshold: float = 0.25, time_thresh: in
         if not ret:
             break
 
-        # Estimate camera motion if we have a previous frame，这个应该是从第二帧开始，使用光流法根据相邻两帧来估计相机的运动，
-        # 得到一个运动向量（dx, dy），然后存储在 camera_motion 列表中
-        if prev_frame is not None:
-            dx, dy = estimate_camera_motion(prev_frame, frame)
-            camera_motion.append((dx, dy))
-        prev_frame = frame.copy()
-
-        # Run YOLOv8 tracking for persons
-        # 这里的 track 方法本身就是为了单帧设计的，会有方法实现跨帧跟踪，传入 persist=True 就是为了让它在内部维护一个跟踪器，这样就能跨帧跟踪了，
-        # conf_threshold 是置信度阈值，classes=[0] 是只检测人类，tracker="botsort.yaml" 是指定使用的跟踪算法
         results = yolo_model.track(frame, persist=True, conf=conf_threshold, classes=[0], verbose=False,
                                    tracker="botsort.yaml")  # person class only
 
-        # person_detections = []  # 看起来每一帧都会重置
-        if results[0].boxes.id is not None:  # 如果在这一帧中检测到行人
+        if results[0].boxes.id is not None:
             boxes = results[0].boxes.xywh.cpu()
             track_ids = results[0].boxes.id.int().cpu().tolist()
 
-            # 对于每一帧检测到的所有边界框和跟踪id
             for box, track_id in zip(boxes, track_ids):
-
-                # Convert boxes to xyxy format for person detections
                 x, y, w, h = box
-                xyxy = [x - w / 2, y - h / 2, x + w / 2, y + h / 2]  # 在图像中，y轴坐标是向下的，PIE 使用的也是这样的计算方法
-                # person_detections.append((xyxy, track_id))
+                xyxy = [x - w / 2, y - h / 2, x + w / 2, y + h / 2]
 
-                # Filter out unrealistic detections，过滤异常框
                 box_area = w * h
                 if box_area < 0.001 * frame_area or box_area > 0.9 * frame_area:
                     continue
 
-                # 初始化/更新该track_id的轨迹
                 if track_id not in track_histories:
                     track_histories[track_id] = {
                         'boxes': [],
@@ -546,18 +561,9 @@ def process_video(video_path: str, conf_threshold: float = 0.25, time_thresh: in
                         'class': 'Pedestrians'
                     }
 
-                # TODO: 这里的 track_id 是直接从 yolov8 里面获取到的，不一定和咱们最后要标注的一致。另外这里的track_histories格式也要进行一定的修改
                 track_histories[track_id]['boxes'].append(xyxy)
                 track_histories[track_id]['centroids'].append([float(x), float(y)])
                 track_histories[track_id]['frame_nums'].append(frame_count)
-
-                # Draw centroid on frame
-                '''cv2.circle(frame, (int(x), int(y)), 4, (0, 255, 0), -1)
-                cv2.putText(frame, f'ID: {track_id}', (int(x), int(y) - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                cv2.imshow('Pedestrian Tracking', frame)  # 显示画面
-                if cv2.waitKey(1) & 0xFF == ord('q'):  # 按 Q 退出
-                    break  # 退出循环'''
 
         # Display frame
         # display_frame_with_grid(frame)
@@ -568,23 +574,6 @@ def process_video(video_path: str, conf_threshold: float = 0.25, time_thresh: in
     # 保存结果
     save_results_to_json(track_histories, r"yolo_tracks.json")
     print(f"轨迹已全部收集完成，总计{len(track_histories)}")
-
-    # Add camera motion to the return dictionary
-    track_histories['camera'] = {
-        'centroids': [[0, 0]],
-        'frame_nums': [0],
-        'class': 'Camera'
-    }
-
-    # Accumulate camera motion
-    cam_x, cam_y = 0, 0
-    for i, (dx, dy) in enumerate(camera_motion, 1):
-        cam_x += dx
-        cam_y += dy
-        track_histories['camera']['centroids'].append([cam_x, cam_y])
-        track_histories['camera']['frame_nums'].append(i)
-
-    print("相机轨迹收集完成")
 
     # Link broken tracks
     # TODO: 如有需要，可以修改 link_broken_tracks 的参数
@@ -674,8 +663,6 @@ def compute_tube_iou(track, input, min_overlap_frames=5):
 def match_objects(tracks, inputs, iou_thresh=0.3, min_overlap_frames=5):
     if not tracks or not inputs:
         raise ValueError("没有轨迹或者输入")
-    # 删除不需要的相机运动
-    tracks.pop('camera', None)
 
     track_ids = list(tracks.keys())
     input_ids = list(inputs.keys())
@@ -709,361 +696,289 @@ def match_objects(tracks, inputs, iou_thresh=0.3, min_overlap_frames=5):
             matches[track_ids[i]] = input_ids[j]  # 返回的是个字典，键是 track_histories 的 id，值是 input_id
     print(f"轨迹已完成匹配，匹配数量为{len(matches)}")
     print(matches)
-    return matches # , pairs, pairs_iou
+    return matches  # , pairs, pairs_iou
 
 
-# 用来测试 轨迹匹配
-def test_match(json_path, gt_path):
-    track_histories = load_json(json_path)
-    inputs = parse_pedestrians(gt_path)
-    matches, pairs, cost = match_objects(track_histories, inputs)
-    print(pairs)
-    print([f"{num:.2f}" for num in cost])
+# ---------------------------------- 相机运动 + 意图定义模块 -----------------------------------
+def _safe_float(v, default=0.0):
+    try:
+        if v is None:
+            return default
+        return float(v)
+    except Exception:
+        return default
 
 
-# ---------------------------- 意图定义模块 ----------------------------
-class IntentAnalyzer:
-    def __init__(self, frame_size: Tuple[int, int], motion_threshold: float = 0.2):
-        """
-        Initialize intent analyzer
+def _normalize_heading_deg(h):
+    """Normalize heading angle to [0, 360)."""
+    h = float(h) % 360.0
+    if h < 0:
+        h += 360.0
+    return h
 
-        Args:
-            frame_size: Size of the video frames (width, height)
-            motion_threshold: Minimum pixel movement to consider as motion
-        """
-        self.frame_size = frame_size
-        self.position_threshold = frame_size[0] / 3  # Center line for left/right position
-        self.motion_threshold = motion_threshold
-        self.track_histories = {}  # Store centroid history for each track
-        self.camera_motion = []  # Store camera centroids for each frame
 
-    def set_camera_motion(self, camera_centroids: list):
-        """
-        Set the camera centroids for the video (should be called before intent analysis)
-        """
-        self.camera_motion = camera_centroids
+def _latlon_to_local_xy_m(lat, lon, lat0, lon0):
+    """
+    Equirectangular approximation from lat/lon to local ENU-like meters.
+    Returns (x_east, y_north) in meters relative to (lat0, lon0).
+    """
+    # Earth radius (m)
+    r = 6378137.0
+    lat = np.deg2rad(lat)
+    lon = np.deg2rad(lon)
+    lat0 = np.deg2rad(lat0)
+    lon0 = np.deg2rad(lon0)
 
-    def update_track_history(self, track_id: int, centroid: Tuple[int, int]):
-        """Update tracking history for a specific track ID"""
-        if track_id not in self.track_histories:
-            self.track_histories[track_id] = []
-        self.track_histories[track_id].append(centroid)
+    x = (lon - lon0) * np.cos(0.5 * (lat + lat0)) * r
+    y = (lat - lat0) * r
+    return float(x), float(y)
 
-    # 相对于自车的左右，一分为三
-    def determine_position(self, centroid: Tuple[int, int]) -> str:
-        """Determine object position relative to ego vehicle"""
-        if centroid[0] < self.position_threshold:
-            return "Left of ego vehicle"
-        if centroid[0] > self.frame_size[0] - self.position_threshold:
-            return "Right of ego vehicle"
-        return "Front of ego vehicle"
 
-    # TODO: 这个函数实际上使用的时候是直接用行人整体轨迹的首位位移差减去相机的运动
-    def determine_intent(self, track_id: int, cam_dx, cam_dy) -> List[str]:
-        """
-        Determine vertical and lateral intent based on track history and camera motion.
-        Returns [lateral_intent, vertical_intent]
-        """
-        history = list(self.track_histories.get(track_id, []))
-        if len(history) < 3:
-            return ["stationary", "stationary"]
+def load_camera_calibration(calibration_json_path: str) -> Dict[str, Any]:
+    calib = load_json(calibration_json_path)
+    k = np.array(calib.get("K", []), dtype=np.float64)
+    if k.shape != (3, 3):
+        raise ValueError(f"Invalid K shape: {k.shape}")
 
-        # If camera motion is available, subtract it from object centroids
-        if self.camera_motion and len(self.camera_motion) >= len(history) and False:
-            rel_history = [
-                (obj[0] - cam[0], obj[1] - cam[1])
-                for obj, cam in zip(history, self.camera_motion[-len(history):])
-            ]
+    d_raw = np.array(calib.get("D", []), dtype=np.float64).reshape(-1)
+    if d_raw.size not in (4, 5, 8):
+        raise ValueError(f"Invalid D length: {d_raw.size}, expected 4/5/8")
+
+    dim = calib.get("dim", [1920, 1080])
+    if not isinstance(dim, list) or len(dim) != 2:
+        dim = [1920, 1080]
+
+    return {
+        "K": k,
+        "D": d_raw,
+        "dim": (int(dim[0]), int(dim[1])),
+        "cam_height_mm": _safe_float(calib.get("cam_height_mm", 1270.0), 1270.0),
+        "cam_pitch_deg": _safe_float(calib.get("cam_pitch_deg", -10.0), -10.0),
+    }
+
+
+# 传进来一组图像坐标系下的点（矩阵），返回去畸变后的图像坐标系下的点（矩阵）
+def _undistorted_points_to_pixel(points_xy: np.ndarray, k: np.ndarray, d: np.ndarray) -> np.ndarray:
+    """
+    points_xy: (N,2) distorted pixel
+    return: (N,2) undistorted pixel in same pixel coordinate system (P=K)
+    """
+    pts = points_xy.reshape(-1, 1, 2).astype(np.float64)
+    if d.size == 4:
+        und = cv2.fisheye.undistortPoints(pts, k, d.reshape(4, 1), P=k)
+    else:
+        und = cv2.undistortPoints(pts, k, d.reshape(-1, 1), P=k)
+    return und.reshape(-1, 2)
+
+
+# 这里是在计算畸变体系下的相邻两帧之间的相机位移
+def build_camera_displacements(
+        vehicle_annotations: Dict[int, Dict[str, float]],
+        calibration_json_path: str,
+        max_speed_mps: float = 35.0,
+        smooth_window: int = 5) -> Dict[int, Tuple[float, float]]:
+    """
+    Build per-frame camera displacement in pixel space from PIE vehicle annotations.
+
+    Input:
+        vehicle_annotations:
+            dict keyed by frame id (string/int), each value with possible keys:
+            GPS_speed, OBD_speed, heading_angle, latitude, longitude.
+        video_path: to estimate FPS and dt.
+        calibration_json_path: path to calibration_data.json.
+    Output:
+        {frame_idx: (dx_px, dy_px)}  where frame_idx is current frame id,
+        and displacement corresponds roughly to prev_frame -> current_frame motion.
+
+    Notes:
+        - Robust to missing tail frames: outputs only available IDs; callers can forward-fill zeros.
+        - Robust to missing lat/lon: fallback to speed+heading integration.
+        - Uses K/fx/fy + camera height/pitch for a coarse ground-plane scale (annotation-grade accuracy).
+    输出: {frame_id: (dx_u, dy_u)}，位移定义在“无畸变像素域”。
+    """
+    if not vehicle_annotations:
+        raise ValueError("Missing vehicle annotations")
+
+    # Sort by frame id (id is frame index per your note)
+    frame_ids = sorted(int(x) for x in vehicle_annotations.keys())
+    if len(frame_ids) < 2:
+        return {}
+
+    # Pre-read rows，获取用来计算相机运动的参数
+    rows = []
+    for fid in frame_ids:
+        # 从 vehicle_annotations 里取当前帧 fid 对应的标注行
+        r = vehicle_annotations.get(fid, {})
+        gps_speed = _safe_float(r.get("GPS_speed", 0.0), 0.0)
+        obd_speed = _safe_float(r.get("OBD_speed", 0.0), 0.0)
+        speed = gps_speed if gps_speed > 1e-3 else obd_speed
+        speed = min(max(speed, 0.0), max_speed_mps)
+
+        heading = _normalize_heading_deg(_safe_float(r.get("heading_angle", 0.0), 0.0))
+        lat = r.get("latitude", None)
+        lon = r.get("longitude", None)
+        lat = None if lat is None else _safe_float(lat, None)
+        lon = None if lon is None else _safe_float(lon, None)
+
+        rows.append({"fid": fid, "speed": speed, "heading": heading, "lat": lat, "lon": lon})
+
+    # Reference for local XY，专门把经纬度提取出来
+    valid_geo = [(r["lat"], r["lon"]) for r in rows if r["lat"] is not None and r["lon"] is not None]
+    lat0, lon0 = valid_geo[0] if valid_geo else (None, None)
+
+    prev = rows[0]
+    prev_xy = None
+    if lat0 is not None and prev["lat"] is not None and prev["lon"] is not None:
+        prev_xy = _latlon_to_local_xy_m(prev["lat"], prev["lon"], lat0, lon0)
+
+    # Build meter displacement in vehicle-forward/lateral approx
+    meter_disp = {}  # fid -> (d_right_m, d_forward_m), from prev->curr
+    for i in range(1, len(rows)):
+        cur = rows[i]
+        d_forward, d_right = 0.0, 0.0
+
+        # 1) Try geo delta first
+        if (lat0 is not None and prev["lat"] is not None and prev["lon"] is not None
+                and cur["lat"] is not None and cur["lon"] is not None):
+            cur_xy = _latlon_to_local_xy_m(cur["lat"], cur["lon"], lat0, lon0)
+            dx_e = cur_xy[0] - prev_xy[0]  # east
+            dy_n = cur_xy[1] - prev_xy[1]  # north
+            # Rotate world EN to vehicle frame using previous heading，坐标系变换
+            # heading: 0=north, 90=east
+            hd = np.deg2rad(prev["heading"])
+            fwd_x_e, fwd_y_n = np.sin(hd), np.cos(hd)
+            right_x_e, right_y_n = np.cos(hd), -np.sin(hd)
+
+            d_forward = dx_e * fwd_x_e + dy_n * fwd_y_n
+            d_right = dx_e * right_x_e + dy_n * right_y_n
+            prev_xy = cur_xy
         else:
-            rel_history = history
+            # 2) Fallback to speed * dt and heading change ignored for translation decomposition
+            # 速度单位是 km/h，转换成 m/s 需要除以 3.6；再除以帧率（30）得到每帧的位移
+            d_forward = prev["speed"] / 3.6 / 30.0
+            d_right = 0.0
 
-        # Net movement (first to last)
-        net_dx = rel_history[-1][0] - rel_history[0][0]
-        net_dy = rel_history[-1][1] - rel_history[0][1]
+        meter_disp[cur["fid"]] = (float(d_right), float(d_forward))
+        prev = cur
 
-        # Calculate motion over multiple windows to catch subtle movements
-        windows = [(0, len(rel_history) // 2), (len(rel_history) // 2, len(rel_history))]
-        dx_values = []
-        dy_values = []
-        for start, end in windows:
-            if end - start < 2:
-                continue
-            window = rel_history[start:end]
-            dx = [window[i + 1][0] - window[i][0] for i in range(len(window) - 1)]
-            dy = [window[i + 1][1] - window[i][1] for i in range(len(window) - 1)]
-            dx_values.extend(dx)
-            dy_values.extend(dy)
-        if not dx_values or not dy_values:
-            return ["stationary", "stationary"]
+    # Smooth meter displacement (simple moving average)，数据平滑，避免单帧异常值对后续像素位移计算的过大影响；
+    # 平滑窗口过大会过度模糊，过小则无法有效抑制噪声
+    if smooth_window > 1 and len(meter_disp) >= 3:
+        keys = sorted(meter_disp.keys())
+        arr = np.array([meter_disp[k] for k in keys], dtype=np.float64)
+        pad = smooth_window // 2
+        arr_pad = np.pad(arr, ((pad, pad), (0, 0)), mode="edge")
+        sm = np.array([np.mean(arr_pad[i:i + smooth_window], axis=0) for i in range(len(arr))], dtype=np.float64)
+        for k_id, v in zip(keys, sm):
+            meter_disp[k_id] = (float(v[0]), float(v[1]))
 
-        # Calculate average and consistency of motion
-        avg_dx = np.mean(dx_values)
-        avg_dy = np.mean(dy_values)
-        std_dx = np.std(dx_values)
-        std_dy = np.std(dy_values)
+    # Convert meter displacement -> pixel displacement
+    # Coarse scale:
+    # - lateral: approximately fx * dx / Zref
+    # - forward: approximately fy * dy / Zref (sign adjusted to image y-down convention)
+    # Use Zref from camera height and pitch; keep conservative.
+    calib = load_camera_calibration(calibration_json_path)
+    # 相机的内参矩阵 intrinsic matrix
+    k = calib["K"]
+    fx = float(k[0, 0])
+    fy = float(k[1, 1])
+    h_cam_m = calib["cam_height_mm"] / 1000.0
+    pitch_deg = calib["cam_pitch_deg"]
+    pitch_rad = np.deg2rad(abs(pitch_deg))
+    z_ref = max(8.0, h_cam_m / max(np.tan(max(pitch_rad, np.deg2rad(2.0))), 1e-3))
 
-        # Weighted combination: net movement gets higher weight
-        final_dx = 1 * net_dx + 0 * avg_dx - cam_dx
-        final_dy = 1 * net_dy + 0 * avg_dy - cam_dy
+    undisp = {}
+    for fid, (d_right_m, d_forward_m) in meter_disp.items():
+        dx_u = fx * (d_right_m / z_ref)
+        dy_u = fy * (d_forward_m / z_ref)
+        undisp[int(fid)] = (float(dx_u), float(dy_u))
 
-        # Determine lateral intent (horizontal motion)
-        lateral_intent = "stationary"
-        # if abs(final_dx) > self.motion_threshold and std_dx < abs(final_dx) * 2:
-        if abs(final_dx) > self.motion_threshold:
-            lateral_intent = "goes to the right" if final_dx > 0 else "goes to the left"
-
-        # Determine vertical intent (along road)
-        # Moving up in the frame (negative dy) means moving away from ego vehicle
-        vertical_intent = "stationary"
-        if abs(final_dy) > self.motion_threshold:
-            vertical_intent = "moves away from ego vehicle" if final_dy < 0 else "moves towards ego vehicle"
-        return [lateral_intent, vertical_intent]
-
-    def generate_description(self, intent: List[str]) -> str:
-        """Generate human-readable description from intent"""
-        lateral, vertical = intent
-        return f"Lateral: {lateral}, Vertical: {vertical}"
+    return undisp
 
 
-# 用光流法估计相机运动
-def estimate_camera_motion(frame1: np.ndarray, frame2: np.ndarray) -> Tuple[float, float]:
+def get_pedestrian_real_displacement_endpoints(
+        ped_track: Dict[str, Any],
+        camera_displacements_undistorted: Dict[int, Tuple[float, float]],
+        calibration_json_path: str,
+) -> Dict[str, Any]:
     """
-    Estimate camera motion between two frames using optical flow.
-    Returns the average motion vector (dx, dy).
+    仅首尾点（省算力）:
+      1) 首尾行人质心去畸变
+      2) 累积同时间段相机逐帧位移（无畸变域）
+      3) 相减得到相对道路位移
     """
-    # Convert frames to grayscale
-    gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-    gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+    frame_nums = [int(f) for f in ped_track.get("frame_nums", [])]
+    cents = ped_track.get("centroids", [])
+    if len(frame_nums) != len(cents):
+        raise ValueError(f"轨迹帧数和位置数不一致: frames={len(frame_nums)}, centroids={len(cents)}")
 
-    # Calculate optical flow using Lucas-Kanade method
-    feature_params = dict(maxCorners=100,
-                          qualityLevel=0.3,
-                          minDistance=7,
-                          blockSize=7)
+    s_f, e_f = frame_nums[0], frame_nums[-1]
+    s_p = np.array(cents[0], dtype=np.float64).reshape(1, 2)
+    e_p = np.array(cents[-1], dtype=np.float64).reshape(1, 2)
 
-    p0 = cv2.goodFeaturesToTrack(gray1, mask=None, **feature_params)
-    if p0 is None:
-        return 0, 0
+    calib = load_camera_calibration(calibration_json_path)
+    k, d = calib["K"], calib["D"]
 
-    lk_params = dict(winSize=(15, 15),
-                     maxLevel=2,
-                     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+    s_u = _undistorted_points_to_pixel(s_p, k, d)[0]
+    e_u = _undistorted_points_to_pixel(e_p, k, d)[0]
 
-    p1, st, err = cv2.calcOpticalFlowPyrLK(gray1, gray2, p0, None, **lk_params)
+    # 相机按帧累积（支持轨迹从任意帧开始；有时候车辆标注信息可能不完整，缺帧补0）
+    low, high = min(s_f, e_f), max(s_f, e_f)
+    cam_dx, cam_dy = 0.0, 0.0
+    for f in range(low + 1, high + 1):
+        dxy = camera_displacements_undistorted.get(f, (0.0, 0.0))
+        cam_dx += float(dxy[0])
+        cam_dy += float(dxy[1])
+    if e_f < s_f:
+        cam_dx *= -1.0
+        cam_dy *= -1.0
 
-    # Select good points
-    if p1 is not None:
-        good_new = p1[st == 1]
-        good_old = p0[st == 1]
+    ped_dx = float(e_u[0] - s_u[0])
+    ped_dy = float(e_u[1] - s_u[1])
 
-        # Calculate motion vectors
-        motion_vectors = good_new - good_old
-        # Get median motion to remove outliers
-        if len(motion_vectors) > 0:
-            median_motion = np.median(motion_vectors, axis=0)
-            return median_motion[0], median_motion[1]
+    rel_dx = ped_dx - cam_dx
+    rel_dy = ped_dy - cam_dy
 
-    return 0, 0
+    return {
+        "start_frame": s_f,
+        "end_frame": e_f,
+        "ped_start_und": [float(s_u[0]), float(s_u[1])],
+        "ped_end_und": [float(e_u[0]), float(e_u[1])],
+        "camera_delta_und": [float(cam_dx), float(cam_dy)],
+        "relative_displacement_und": [float(rel_dx), float(rel_dy)],
+    }
 
 
-# 这个函数计算在不同边距下的光流，并返回所有边距的中位数。它可以帮助我们理解在不同空间范围内对象的运动趋势。
-def get_median_optical_flow_multiple_margins(video_path, point, box_size=(50, 150),
-                                             margins=[50, 70, 100, 120, 150, 170, 200, 50], max_frames=100,
-                                             y_shift=False, margin_add=0):
+def determine_intent(
+        ped_track: Dict[str, Any],
+        camera_displacements_undistorted: Dict[int, Tuple[float, float]],
+        calibration_json_path: str,
+        motion_threshold: float = 0.15) -> Tuple[List[str], Dict[str, Any]]:
     """
-    For each margin, sums per-pixel flow across frames in adjacent box, then computes the median dx, dy.
-
-    Args:
-        video_path (str): Path to video file.
-        point (tuple): (x, y) reference point.
-        box_size (tuple): Width and height of each box.
-        margins (list): List of margin values to test.
-        max_frames (int): Max number of frames to process.
-
-    Returns:
-        overall_median_dx, overall_median_dy: Median of summed per-pixel motion across all margins.
+    只用首尾点做意图判定。
     """
-    cap = cv2.VideoCapture(video_path)
-    ret, prev_frame = cap.read()
-    if not ret:
-        print("Failed to read video.")
-        return None, None
+    rs = get_pedestrian_real_displacement_endpoints(
+        ped_track=ped_track,
+        camera_displacements_undistorted=camera_displacements_undistorted,
+        calibration_json_path=calibration_json_path,
+    )
+    rel_dx, rel_dy = rs["relative_displacement_und"]
 
-    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-    h, w = prev_gray.shape
-    x, y = point
-    bw, bh = box_size
-    bw = w
-    margin_medians = []
+    lateral = "stationary"
+    if abs(rel_dx) > motion_threshold:
+        lateral = "goes to the right" if rel_dx > 0 else "goes to the left"
 
-    margins = [x + margin_add for x in margins]
-    for i, margin in enumerate(margins):
-        if i == len(margins) - 1:
-            y_shift = True
-        # Decide box direction
-        if x < w / 3:
-            box_x = x + margin
-        elif x > 2 * w / 3:
-            box_x = x - margin - bw
-        else:
-            box_x = x + margin if random.random() > 0.5 else x - margin - bw
+    vertical = "stationary"
+    if abs(rel_dy) > motion_threshold:
+        vertical = "moves away from ego vehicle" if rel_dy < 0 else "moves towards ego vehicle"
 
-        if y_shift:
-            box_y = y + margin - bh
-
-        # Clamp to image bounds
-        box_x = int(max(0, min(w - bw, box_x)))
-        box_y = int(max(0, min(h - bh, y - bh // 2)))
-
-        # Prepare flow accumulator for the box region
-        flow_sum = np.zeros((bh, bw, 2), dtype=np.float32)
-
-        # Rewind and process
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        ret, prev_frame = cap.read()
-        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-
-        frame_count = 0
-        while frame_count < max_frames:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
-                                                0.5, 3, 15, 3, 5, 1.2, 0)
-
-            # Extract and accumulate flow in the box
-            flow_box = flow[box_y:box_y + bh, box_x:box_x + bw]
-            flow_sum += flow_box
-
-            prev_gray = gray
-            frame_count += 1
-
-        # Now compute medians from summed flow
-        total_dx = flow_sum[..., 0].flatten()
-        total_dy = flow_sum[..., 1].flatten()
-        median_dx = float(np.median(total_dx))
-        median_dy = float(np.median(total_dy))
-        print(f"Margin {margin}: Median Total dx = {median_dx:.2f}, dy = {median_dy:.2f}")
-        margin_medians.append((median_dx, median_dy))
-
-    cap.release()
-
-    # Final median over margins
-    all_dx = [dx for dx, _ in margin_medians]
-    all_dy = [dy for _, dy in margin_medians]
-    all_dx.sort()
-    all_dy.sort()
-    overall_median_dx = float(np.mean(all_dx))
-    overall_median_dy = float(np.mean(all_dy))
-
-    print(f"\n→ Overall Median dx = {overall_median_dx:.2f}, dy = {overall_median_dy:.2f}")
-    return overall_median_dx, overall_median_dy
-
-
-# 这个函数是上一个函数的简化版本，只计算一个边距下的光流中位数。它可以作为快速评估对象运动趋势的工具。
-def get_median_optical_flow(video_path, point, box_h=150, max_frames=100, y_shift=False):
-    """
-    For each margin, sums per-pixel flow across frames in adjacent box, then computes the median dx, dy.
-
-    Args:
-        video_path (str): Path to video file.
-        point (tuple): (x, y) reference point.
-        box_size (tuple): Width and height of each box.
-        margins (list): List of margin values to test.
-        max_frames (int): Max number of frames to process.
-
-    Returns:
-        overall_median_dx, overall_median_dy: Median of summed per-pixel motion across all margins.
-    """
-    cap = cv2.VideoCapture(video_path)
-    ret, prev_frame = cap.read()
-    if not ret:
-        print("Failed to read video.")
-        return None, None
-
-    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-    h, w = prev_gray.shape
-    x, y = point
-    bh = box_h
-    bw = w
-    box_x = 0
-
-    if y_shift:
-        box_y = y + 50 - bh
-
-    # Clamp to image bounds
-    box_x = int(max(0, min(w - bw, box_x)))
-    box_y = int(max(0, min(h - bh, y - bh // 2)))
-
-    # Prepare flow accumulator for the box region
-    flow_sum = np.zeros((bh, bw, 2), dtype=np.float32)
-
-    # Rewind and process
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    ret, prev_frame = cap.read()
-    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-
-    frame_count = 0
-    while frame_count < max_frames:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
-                                            0.5, 3, 15, 3, 5, 1.2, 0)
-
-        # Extract and accumulate flow in the box
-        flow_box = flow[box_y:box_y + bh, box_x:box_x + bw]
-        flow_sum += flow_box
-
-        prev_gray = gray
-        frame_count += 1
-
-    # Now compute medians from summed flow
-    total_dx = flow_sum[..., 0].flatten()
-    total_dy = flow_sum[..., 1].flatten()
-
-    avg_dx_per_col = np.mean(flow_sum[..., 0], axis=0)
-    avg_dy_per_col = np.mean(flow_sum[..., 1], axis=0)
-
-    median_dx = float(np.median(total_dx))
-    '''
-    Uncomment to plot per-column flow
-
-    # Plotting both
-    plt.figure()
-    plt.plot(avg_dx_per_col, label='Average X Flow')
-    plt.plot(avg_dy_per_col, label='Average Y Flow')
-    plt.title("Average Optical Flow per Column")
-    plt.xlabel("Column Index")
-    plt.ylabel("Average Displacement")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-    '''
-    positive_dy = avg_dy_per_col[avg_dy_per_col > 0].flatten()
-    median_dy = float(np.median(positive_dy))
-    '''
-    # Plot histogram
-    plt.figure()
-    plt.hist(positive_dy, bins=30)
-    plt.title("Histogram of Positive Y Flow Values")
-    plt.xlabel("Y Displacement")
-    plt.ylabel("Frequency")
-    plt.grid(True)
-    plt.show()
-    cap.release()
-    '''
-
-    # print(f"\n→ Overall Median dx = {median_dx:.2f}, dy = {median_dy:.2f}")
-    return median_dx, median_dy
+    return [lateral, vertical], rs
 
 
 # --------------------------------- 可视化模块 -------------------------------------
 from matplotlib import animation
+
+
 # 这个函数使用光流法计算视频帧之间的运动，并创建一个动画来可视化这些运动。它可以帮助我们理解视频中对象的动态行为。
 # TODO: 或许可以用于可视化检查结果
 def animate_optical_flow(video_path, max_frames=100, step=1):
@@ -1117,6 +1032,7 @@ def animate_optical_flow(video_path, max_frames=100, step=1):
 
     ani = animation.FuncAnimation(fig, update, frames=len(frames), interval=50, blit=True)
     # display(HTML(ani.to_jshtml()))
+
 
 def plot_3d_tracks(track_histories: Dict[int, Dict], title: str = "Object Tracks in 3D"):
     """
@@ -1201,11 +1117,11 @@ def display_frame_with_grid(frame: np.ndarray):
 
 # ------------------------------------ 主函数 -------------------------------------
 # 这个函数应该是完整的数据处理流程
-def process_dataset(video_root: str, anno_root: str, output_dir: str):
+def process_dataset(video_root: str, anno_root: str, vehicle_root: str, camera_param_path: str, output_dir: str):
     """Process entire dataset and save results"""
 
     # 加载路径
-    dataset_path = build_dataset(video_root, anno_root)
+    dataset_path = build_dataset(video_root, anno_root, vehicle_root)
     # Create output directory，如果存在就跳过，应该只用生成 xml 标注文件
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1228,21 +1144,12 @@ def process_dataset(video_root: str, anno_root: str, output_dir: str):
 
         # Get video dimensions from first frame
         # animate_optical_flow(video_path)
-        width = 1920
-        height = 1080
 
-        # Initialize intent analyzer with more sensitive threshold
-        intent_analyzer = IntentAnalyzer(frame_size=(width, height), motion_threshold=0.15)
-
-        # Track objects in video and get their histories，这里应该是相当于获取行人和相机的轨迹，行人轨迹已经合并了，并且生成的是新的id
-        track_histories = process_video(video_path, intent_analyzer)
+        # Track objects in video and get their histories，这里应该是相当于获取行人的轨迹，行人轨迹已经合并了，并且生成的是新的id
+        track_histories, camera = process_video(video_path)
 
         # 如果出错了，就使用这个函数加载
         # track_histories = load_json(r"filtered_tracks.json")
-
-        # Set camera motion in intent analyzer，只是单纯赋了个值
-        if 'camera' in track_histories:
-            intent_analyzer.set_camera_motion(track_histories['camera']['centroids'])
 
         # Plot 3D tracks for this sample，这是在 for 循环里的啊
         # plot_3d_tracks(track_histories, f"Object Tracks - Sample {sample_id}")
@@ -1250,34 +1157,26 @@ def process_dataset(video_root: str, anno_root: str, output_dir: str):
         # Match objects using Hungarian algorithm
         matches = match_objects(track_histories, output_data)
 
+        # 获取相机帧间位移
+        vehicle = parse_vehicle(sample_data['vehicle_path'])
+        camera = build_camera_displacements(vehicle, camera_param_path)
+        save_results_to_json(camera, r"camera_displacements.json")
+        print(f"相机位移已计算完成")
+
         # Process direction intention
+        motion = {}
         for track_id, track_data in track_histories.items():
-
-            '''# Update track history for intent analysis
-            for i, centroid in enumerate(track_data['centroids']):
-                if i == 0:
-                    # Get camera motion
-                    cam_dx, cam_dy = get_median_optical_flow(video_path, (centroid[0], centroid[1]))
-
-                    iter = 0
-                    while cam_dy < 0:
-                        cam_dx, cam_dy = get_median_optical_flow_multiple_margins(video_path,
-                                                                                  (centroid[0], centroid[1]),
-                                                                                  y_shift=True,
-                                                                                  margin_add=iter * 5)
-                        iter += 1
-                        if iter > 10:
-                            cam_dx, cam_dy = 0, 0
-                            break
-
-                # 这个就是简单赋值
-                intent_analyzer.update_track_history(track_id, centroid)'''
-
             # 这里输出的是 [lateral intent, vertical intent]
-            # track_histories[track_id]['dir_intent'] = intent_analyzer.determine_intent(track_id, cam_dx, cam_dy)
-            track_histories[track_id]['dir_intent'] = ["left", "close"]
+            track_histories[track_id]['dir_intent'], check_point = determine_intent(track_data, camera,
+                                                                                    camera_param_path,
+                                                                                    motion_threshold=0.15)
+            motion[track_id] = check_point
 
-        # 对方输出的description或许我并不需要
+        # TODO: 匹配结束之后，GT可能有些没匹配上，这时候就需要对他们进行意图分析
+
+
+        save_results_to_json(motion, r"motion_check.json")
+
         save_xml_annotation(anno_path, output_dir, track_histories, matches)
         count += 1
 
@@ -1292,6 +1191,49 @@ def main():
     # test_match(r"filtered_tracks.json", r"PIE/annotation/set02/video_0003_annt.xml")
 
 
+# ------------------------------------- 测试 ----------------------------------------
+# 用来测试 轨迹匹配
+def test_match(json_path, gt_path):
+    track_histories = load_json(json_path)
+    inputs = parse_pedestrians(gt_path)
+    matches, pairs, cost = match_objects(track_histories, inputs)
+    print(pairs)
+    print([f"{num:.2f}" for num in cost])
+
+
+def test_camera_motion(json_path):
+    all_tracks = load_json(json_path)
+    obj = all_tracks['5420']
+    camera = all_tracks.get('camera', {})
+    new_camera = camera
+    obj_frames = obj['frame_nums']
+    obj_track = obj['centroids']
+    camera_track = [new_camera[frame] for frame in obj_frames]
+    print(obj_track[0])
+    print(obj_track[1])
+    print(obj_track[-1])
+    print(camera_track[0])
+    print(camera_track[1])
+    print(camera_track[-1])
+
+
+def test_intent_from_track(json_path, vehicle_path, calibration_json_path):
+    # 先尝试只对一个行人的意图进行分析
+    all_tracks = load_json(json_path)
+    obj = all_tracks['5420']
+
+    vehicle = parse_vehicle(vehicle_path)
+    camera = build_camera_displacements(vehicle, calibration_json_path)
+    save_results_to_json(camera, r"camera_displacements.json")
+
+    intent, checkpoint = determine_intent(obj, camera, calibration_json_path, motion_threshold=0.15)
+    print(intent)
+    print(checkpoint)
+
 
 if __name__ == "__main__":
-    main()
+    # main()
+    # test_camera_motion(r"filtered_tracks.json")
+    test_intent_from_track(r"filtered_tracks.json",
+                           r"PIE/annotation_vehicle/set02/video_0003_obd.xml",
+                           r"PIE/camera_params/calibration_data.json")
