@@ -27,6 +27,7 @@ from multiprocessing import Pool, cpu_count
 import xml.etree.ElementTree as ET  # 用于解析、编辑 XML 文件
 import json
 
+
 # Check for GPU availability
 #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 #print(f"Using device: {device}")
@@ -146,7 +147,10 @@ def parse_vehicle(vehicle_path: str) -> Dict[int, Dict[str, float]]:
             "OBD_speed": float(track.get('OBD_speed', 0.0)),
             "latitude": float(track.get('latitude', 0.0)),
             "longitude": float(track.get('longitude', 0.0)),
-            "heading_angle": float(track.get('heading_angle', 0.0))}
+            "heading_angle": float(track.get('heading_angle', 0.0)),
+            "pitch": float(track.get('pitch', 0.0)),
+            "roll": float(track.get('roll', 0.0)),
+            "yaw": float(track.get('yaw', 0.0))}
 
     return vehicle
 
@@ -794,7 +798,7 @@ def build_camera_displacements(
         - Robust to missing tail frames: outputs only available IDs; callers can forward-fill zeros.
         - Robust to missing lat/lon: fallback to speed+heading integration.
         - Uses K/fx/fy + camera height/pitch for a coarse ground-plane scale (annotation-grade accuracy).
-    输出: {frame_id: (dx_u, dy_u)}，位移定义在“无畸变像素域”。
+    输出: {frame_id: (dx_u, dy_u)}，北向(x)和东向(y)的物理位移。
     """
     if not vehicle_annotations:
         raise ValueError("Missing vehicle annotations")
@@ -835,14 +839,17 @@ def build_camera_displacements(
     meter_disp = {}  # fid -> (d_right_m, d_forward_m), from prev->curr
     for i in range(1, len(rows)):
         cur = rows[i]
-        d_forward, d_right = 0.0, 0.0
+        # d_forward, d_right = 0.0, 0.0
+        dx_n, dy_e = 0.0, 0.0
 
         # 1) Try geo delta first
         if (lat0 is not None and prev["lat"] is not None and prev["lon"] is not None
                 and cur["lat"] is not None and cur["lon"] is not None):
             cur_xy = _latlon_to_local_xy_m(cur["lat"], cur["lon"], lat0, lon0)
-            dx_e = cur_xy[0] - prev_xy[0]  # east
-            dy_n = cur_xy[1] - prev_xy[1]  # north
+            dy_e = cur_xy[0] - prev_xy[0]  # east
+            dx_n = cur_xy[1] - prev_xy[1]  # north
+
+            '''
             # Rotate world EN to vehicle frame using previous heading，坐标系变换
             # heading: 0=north, 90=east
             hd = np.deg2rad(prev["heading"])
@@ -850,7 +857,7 @@ def build_camera_displacements(
             right_x_e, right_y_n = np.cos(hd), -np.sin(hd)
 
             d_forward = dx_e * fwd_x_e + dy_n * fwd_y_n
-            d_right = dx_e * right_x_e + dy_n * right_y_n
+            d_right = dx_e * right_x_e + dy_n * right_y_n'''
             prev_xy = cur_xy
         else:
             # 2) Fallback to speed * dt and heading change ignored for translation decomposition
@@ -858,7 +865,7 @@ def build_camera_displacements(
             d_forward = prev["speed"] / 3.6 / 30.0
             d_right = 0.0
 
-        meter_disp[cur["fid"]] = (float(d_right), float(d_forward))
+        meter_disp[cur["fid"]] = (float(dx_n), float(dy_e))
         prev = cur
 
     # Smooth meter displacement (simple moving average)，数据平滑，避免单帧异常值对后续像素位移计算的过大影响；
@@ -872,6 +879,7 @@ def build_camera_displacements(
         for k_id, v in zip(keys, sm):
             meter_disp[k_id] = (float(v[0]), float(v[1]))
 
+    '''
     # Convert meter displacement -> pixel displacement
     # Coarse scale:
     # - lateral: approximately fx * dx / Zref
@@ -892,21 +900,233 @@ def build_camera_displacements(
         dx_u = fx * (d_right_m / z_ref)
         dy_u = fy * (d_forward_m / z_ref)
         undisp[int(fid)] = (float(dx_u), float(dy_u))
+    '''
+
+    return meter_disp
+
+
+def compute_pixel_displacement_pie(
+        t_veh: np.ndarray,  # [dx_n, dy_n, 0] 车辆坐标系位移（米），前一帧和当前帧之间的位移
+        heading: float,  # 前一帧 heading_angle（度）
+        delta_heading: float,  # 当前帧与上一帧的 heading_angle 变化（度）
+        cam_pitch_deg: float,  # 相机 pitch_angle（度）
+        K: np.ndarray,
+        Ki: np.ndarray,
+        cam_height_m: float,
+        ref_point_uv: tuple = None
+) -> tuple:
+    cx = K[0, 2]
+    cy = K[1, 2]
+    if ref_point_uv is None:
+        u0, v0 = cx, cy
+    else:
+        u0, v0 = ref_point_uv
+
+    # 从世界坐标系（北东地）转换到第一帧的相机坐标系的旋转矩阵
+    R1 = np.array([[1, 0, 0],
+                   [0, np.cos(th_x := np.deg2rad(90 - cam_pitch_deg)), -np.sin(th_x)],
+                   [0, np.sin(th_x), np.cos(th_x)]])
+    R2 = np.array([[np.cos(th_y := np.deg2rad(90 + heading)), 0, np.sin(th_y)],
+                   [0, 1, 0],
+                   [-np.sin(th_y), 0, np.cos(th_y)]])
+    R3 = np.array([[np.cos(th_y := np.deg2rad(delta_heading)), 0, np.sin(th_y)],
+                   [0, 1, 0],
+                   [-np.sin(th_y), 0, np.cos(th_y)]])
+    R_wc1 = R1 @ R2
+    R_rel = R_wc1 @ R3 @ R_wc1.T  # 从第一帧相机坐标系到当前帧相机坐标系的旋转矩阵
+
+    t = np.array([-t_veh[0], -t_veh[1], 0]).reshape(-1, 1)
+    T_rel = R_wc1 @ R3 @ t
+
+    p1 = np.array([u0, v0, 1]).reshape(-1, 1)
+    n_w = np.array([0, 0, 1]).reshape(-1, 1)
+    n_c1 = R_wc1 @ n_w
+    s1 = cam_height_m / (n_c1.T @ Ki @ p1)
+
+    p2 = K @ (R_rel @ (s1 * Ki @ p1) + T_rel)
+    u1 = p2[0, 0] / p2[2, 0]
+    v1 = p2[1, 0] / p2[2, 0]
+    return float(u1 - u0), float(v1 - v0)
+
+
+'''
+    # 1. 构造世界到相机坐标系的旋转矩阵（使用 heading, pitch, roll）
+    # R_wc = euler_to_rot_matrix_from_imu(pitch_deg, roll_deg, heading_deg)
+    # TODO: 从世界坐标系（车辆）转换到相机坐标系的旋转矩阵，旋转角为 90 + camera_pitch_deg，绕 x 轴旋转，这里直接硬编码了
+    R_wc = np.array([[1, 0, 0],
+                    [0, np.cos(np.deg2rad(90-cam_pitch_deg)), -np.sin(np.deg2rad(90-cam_pitch_deg))],
+                    [0, np.sin(np.deg2rad(90-cam_pitch_deg)), np.cos(np.deg2rad(90-cam_pitch_deg))]])
+
+    # 2. 地平面在世界坐标系中为 z=0，法向量 n_w = [0,0,1]^T，距离 d = cam_height_m
+    n_world = np.array([0, 0, 1])
+    n_cam = R_wc @ n_world
+    d_cam = cam_height_m
+
+    # 3. 车辆平移转换到相机坐标系
+    t_cam = R_wc @ np.array([t_veh[0], t_veh[1], t_veh[2]])
+
+    # 4. 帧间相对旋转：假设相邻帧姿态变化很小，忽略旋转（R_rel = I）
+    R_rel = np.eye(3)
+
+    # 5. 单应矩阵
+    M = R_rel - (t_cam[:, None] @ n_cam[None, :]) / -d_cam
+    H = K @ M @ Ki
+
+    # 6. 计算参考点位移
+    p0 = np.array([u0, v0, 1.0])
+    p1 = H @ p0
+    u1 = p1[0] / p1[2]
+    v1 = p1[1] / p1[2]
+    return float(u1 - u0), float(v1 - v0)
+'''
+
+
+def build_camera_displacements_corrected(
+        vehicle_annotations: Dict[int, Dict[str, float]],
+        calibration_json_path: str,
+        max_speed_mps: float = 35.0,
+        smooth_window: int = 5
+) -> Dict[int, Tuple[float, float]]:
+    """
+    修正版本：正确使用物理位移 + 姿态角计算像素位移。
+    输出格式与原函数一致：{frame_id: (dx_px, dy_px)}
+    """
+    # ---- 数据解析部分（与原函数相同） ----
+    if not vehicle_annotations:
+        raise ValueError("Missing vehicle annotations")
+
+    frame_ids = sorted(int(x) for x in vehicle_annotations.keys())
+    if len(frame_ids) < 2:
+        return {}
+
+    rows = []
+    for fid in frame_ids:
+        r = vehicle_annotations.get(fid, {})
+        gps_speed = _safe_float(r.get("GPS_speed", 0.0), 0.0)
+        obd_speed = _safe_float(r.get("OBD_speed", 0.0), 0.0)
+        speed = gps_speed if gps_speed > 1e-3 else obd_speed
+        speed = min(max(speed, 0.0), max_speed_mps)
+
+        heading = _normalize_heading_deg(_safe_float(r.get("heading_angle", 0.0), 0.0))
+        # 假设标注中也有 pitch, roll
+        pitch = _safe_float(r.get("pitch", 0.0), 0.0)
+        roll = _safe_float(r.get("roll", 0.0), 0.0)
+
+        lat = r.get("latitude", None)
+        lon = r.get("longitude", None)
+        lat = None if lat is None else _safe_float(lat, None)
+        lon = None if lon is None else _safe_float(lon, None)
+
+        rows.append({
+            "fid": fid,
+            "speed": speed,
+            "heading": heading,
+            "pitch": pitch,
+            "roll": roll,
+            "lat": lat,
+            "lon": lon
+        })
+
+    # ---- 计算相邻帧间的车辆坐标系位移 (d_right, d_forward) ----
+    # 原函数中这部分逻辑保留，但要注意它已经用了 heading 旋转世界位移到车辆系。
+    valid_geo = [(r["lat"], r["lon"]) for r in rows if r["lat"] is not None and r["lon"] is not None]
+    lat0, lon0 = valid_geo[0] if valid_geo else (None, None)
+
+    prev = rows[0]
+    prev_xy = None
+    if lat0 is not None and prev["lat"] is not None and prev["lon"] is not None:
+        prev_xy = _latlon_to_local_xy_m(prev["lat"], prev["lon"], lat0, lon0)
+
+    meter_disp = {}  # fid -> (d_right_m, d_forward_m)
+    for i in range(1, len(rows)):
+        cur = rows[i]
+        # d_forward, d_right = 0.0, 0.0
+        dx_n, dy_e = 0.0, 0.0
+
+        # 1) 尝试用 GPS 计算位移（世界坐标系 ENU）
+        if (lat0 is not None and prev["lat"] is not None and prev["lon"] is not None
+                and cur["lat"] is not None and cur["lon"] is not None):
+            cur_xy = _latlon_to_local_xy_m(cur["lat"], cur["lon"], lat0, lon0)
+            dy_e = cur_xy[0] - prev_xy[0]  # 东
+            dx_n = cur_xy[1] - prev_xy[1]  # 北
+
+            # 用前一帧 heading 将 ENU 位移旋转到车辆坐标系
+            '''hd = np.deg2rad(prev["heading"])
+            fwd_x_e, fwd_y_n = np.sin(hd), np.cos(hd)   # 北为0°，顺时针增加
+            right_x_e, right_y_n = np.cos(hd), -np.sin(hd)
+
+            d_forward = dx_e * fwd_x_e + dy_n * fwd_y_n
+            d_right = dx_e * right_x_e + dy_n * right_y_n'''
+            prev_xy = cur_xy
+        else:
+            # 2) 无 GPS，用速度积分
+            d_forward = prev["speed"] / 3.6 / 30.0  # 假设 30fps
+            d_right = 0.0
+
+        # meter_disp[cur["fid"]] = (float(d_right), float(d_forward))
+        meter_disp[cur["fid"]] = (float(dx_n), float(dy_e))
+        prev = cur
+
+    # ---- 平滑处理（可选） ----
+    if smooth_window > 1 and len(meter_disp) >= 3:
+        keys = sorted(meter_disp.keys())
+        arr = np.array([meter_disp[k] for k in keys], dtype=np.float64)
+        pad = smooth_window // 2
+        arr_pad = np.pad(arr, ((pad, pad), (0, 0)), mode="edge")
+        sm = np.array([np.mean(arr_pad[i:i + smooth_window], axis=0) for i in range(len(arr))])
+        for k_id, v in zip(keys, sm):
+            meter_disp[k_id] = (float(v[0]), float(v[1]))
+
+    # ---- 加载相机参数 ----
+    calib = load_camera_calibration(calibration_json_path)
+    K = calib["K"]
+    Ki = np.linalg.inv(K)
+    cam_height_m = calib["cam_height_mm"] / 1000.0
+    cam_pitch_deg = np.deg2rad(calib["cam_pitch_deg"])
+
+    # ---- 计算每帧的像素位移（使用修正后的方法） ----
+    undisp = {}
+    for fid, (d_north, d_east) in meter_disp.items():
+        # 获取当前帧的姿态（如果每帧都有）
+        cur_row = next((r for r in rows if r["fid"] == fid), None)
+        if cur_row is None:
+            continue
+
+        # 车辆坐标系平移（无垂直位移）
+        # t_veh = np.array([d_right, d_forward, 0.0])
+        t_veh = np.array([d_north, d_east, 0.0])
+
+        du, dv = compute_pixel_displacement_pie(
+            t_veh=t_veh,
+            heading=rows[fid - 1]['heading'],
+            delta_heading=rows[fid]['heading'] - rows[fid - 1]['heading'],
+            cam_pitch_deg=cam_pitch_deg,
+            K=K,
+            Ki=Ki,
+            cam_height_m=cam_height_m,  #
+            ref_point_uv=(1755, 832)  #   # TODO: 修改为行人轨迹的初始边界框的右下坐标  1312, 823  1439,810  207,846
+        )
+
+        undisp[int(fid)] = (du, dv)
 
     return undisp
 
 
 def get_pedestrian_real_displacement_endpoints(
         ped_track: Dict[str, Any],
-        camera_displacements_undistorted: Dict[int, Tuple[float, float]],
+        camera_displacements: Dict[int, Tuple[float, float]],
         calibration_json_path: str,
 ) -> Dict[str, Any]:
     """
+    输入：ped_track 一个行人的轨迹
+         camera_displacements 相机的所有逐帧物理位移
+         calibration_json_path 相机参数文件路径
     仅首尾点（省算力）:
       1) 首尾行人质心去畸变
       2) 累积同时间段相机逐帧位移（无畸变域）
       3) 相减得到相对道路位移
     """
+    # TODO: 后续打算给相机位移也增加首尾可选项，但目前先默认从第一帧开始累积，直到轨迹结束（如果中间有缺帧，则补0），以保证相机位移的完整性
     frame_nums = [int(f) for f in ped_track.get("frame_nums", [])]
     cents = ped_track.get("centroids", [])
     if len(frame_nums) != len(cents):
@@ -926,7 +1146,7 @@ def get_pedestrian_real_displacement_endpoints(
     low, high = min(s_f, e_f), max(s_f, e_f)
     cam_dx, cam_dy = 0.0, 0.0
     for f in range(low + 1, high + 1):
-        dxy = camera_displacements_undistorted.get(f, (0.0, 0.0))
+        dxy = camera_displacements.get(f, (0.0, 0.0))
         cam_dx += float(dxy[0])
         cam_dy += float(dxy[1])
     if e_f < s_f:
@@ -959,7 +1179,7 @@ def determine_intent(
     """
     rs = get_pedestrian_real_displacement_endpoints(
         ped_track=ped_track,
-        camera_displacements_undistorted=camera_displacements_undistorted,
+        camera_displacements=camera_displacements_undistorted,
         calibration_json_path=calibration_json_path,
     )
     rel_dx, rel_dy = rs["relative_displacement_und"]
@@ -1174,7 +1394,6 @@ def process_dataset(video_root: str, anno_root: str, vehicle_root: str, camera_p
 
         # TODO: 匹配结束之后，GT可能有些没匹配上，这时候就需要对他们进行意图分析
 
-
         save_results_to_json(motion, r"motion_check.json")
 
         save_xml_annotation(anno_path, output_dir, track_histories, matches)
@@ -1220,11 +1439,11 @@ def test_camera_motion(json_path):
 def test_intent_from_track(json_path, vehicle_path, calibration_json_path):
     # 先尝试只对一个行人的意图进行分析
     all_tracks = load_json(json_path)
-    obj = all_tracks['5420']
+    obj = all_tracks['5489']
 
     vehicle = parse_vehicle(vehicle_path)
-    camera = build_camera_displacements(vehicle, calibration_json_path)
-    save_results_to_json(camera, r"camera_displacements.json")
+    camera = build_camera_displacements_corrected(vehicle, calibration_json_path)
+    # save_results_to_json(camera, r"camera_displacements.json")
 
     intent, checkpoint = determine_intent(obj, camera, calibration_json_path, motion_threshold=0.15)
     print(intent)
