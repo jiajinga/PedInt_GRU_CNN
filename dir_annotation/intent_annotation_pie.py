@@ -26,6 +26,10 @@ import torch
 from multiprocessing import Pool, cpu_count
 import xml.etree.ElementTree as ET  # 用于解析、编辑 XML 文件
 import json
+import pandas as pd
+
+
+# import openpyxl
 
 
 # Check for GPU availability
@@ -312,6 +316,43 @@ def load_json(file_path):
         return json.load(f)
 
 
+def _flatten_for_excel(value, prefix: str, row: Dict[str, Any]):
+    """Flatten nested checkpoint fields into Excel-friendly columns."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _flatten_for_excel(v, f"{prefix}_{k}" if prefix else str(k), row)
+    elif isinstance(value, (list, tuple)):
+        if len(value) == 2 and all(isinstance(v, (int, float, np.integer, np.floating)) for v in value):
+            row[f"{prefix}_x"] = float(value[0])
+            row[f"{prefix}_y"] = float(value[1])
+        else:
+            for idx, item in enumerate(value):
+                _flatten_for_excel(item, f"{prefix}_{idx}" if prefix else str(idx), row)
+    else:
+        row[prefix] = value
+
+
+def save_checkpoints_to_excel(checkpoints: Dict[str, Dict[str, Any]], output_xlsx_path: str) -> None:
+    """Save per-track checkpoint data to an Excel file, with a CSV fallback."""
+    rows = []
+    for track_id, checkpoint in checkpoints.items():
+        row = {"track_id": track_id}
+        _flatten_for_excel(checkpoint, "", row)
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if not df.empty and "track_id" in df.columns:
+        df = df.set_index("track_id")
+
+    try:
+        df.to_excel(output_xlsx_path, index=True, engine="xlsxwriter")
+        print(f"Saved Excel to {output_xlsx_path}")
+    except Exception as exc:
+        csv_path = os.path.splitext(output_xlsx_path)[0] + ".csv"
+        df.to_csv(csv_path, index=True, encoding="utf-8-sig")
+        print(f"Excel export failed ({exc}); saved CSV to {csv_path} instead")
+
+
 # ------------------------------- 轨迹连接模块 ----------------------------------
 # 预测未来位置，考虑最近的运动趋势和加速度，并返回一个置信度分数，在 should_merge_tracks 中使用
 def predict_next_position(track: Dict, num_frames: int = 1) -> Tuple[np.ndarray, float]:
@@ -384,7 +425,7 @@ def calculate_appearance_similarity(frame1: np.ndarray, frame2: np.ndarray,
         hist2 = cv2.calcHist([gray2], [0], None, [256], [0, 256])
 
         similarity = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
-        return max(0, similarity)  # Ensure non-negative
+        return float(max(0.0, similarity))  # Ensure non-negative
     except:
         return 0.0
 
@@ -738,6 +779,15 @@ def _latlon_to_local_xy_m(lat, lon, lat0, lon0):
     return float(x), float(y)
 
 
+def _safe_optional_float(v):
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
 def load_camera_calibration(calibration_json_path: str) -> Dict[str, Any]:
     calib = load_json(calibration_json_path)
     k = np.array(calib.get("K", []), dtype=np.float64)
@@ -819,10 +869,8 @@ def build_camera_displacements(
         speed = min(max(speed, 0.0), max_speed_mps)
 
         heading = _normalize_heading_deg(_safe_float(r.get("heading_angle", 0.0), 0.0))
-        lat = r.get("latitude", None)
-        lon = r.get("longitude", None)
-        lat = None if lat is None else _safe_float(lat, None)
-        lon = None if lon is None else _safe_float(lon, None)
+        lat = _safe_optional_float(r.get("latitude", None))
+        lon = _safe_optional_float(r.get("longitude", None))
 
         rows.append({"fid": fid, "speed": speed, "heading": heading, "lat": lat, "lon": lon})
 
@@ -865,6 +913,11 @@ def build_camera_displacements(
             d_forward = prev["speed"] / 3.6 / 30.0
             d_right = 0.0
 
+            # heading 是相对于正北的角度，顺时针增加
+            hd = np.deg2rad(prev["heading"])
+            dx_n = d_forward * np.cos(hd) - d_right * np.sin(hd)
+            dy_e = d_forward * np.sin(hd) + d_right * np.cos(hd)
+
         meter_disp[cur["fid"]] = (float(dx_n), float(dy_e))
         prev = cur
 
@@ -875,32 +928,9 @@ def build_camera_displacements(
         arr = np.array([meter_disp[k] for k in keys], dtype=np.float64)
         pad = smooth_window // 2
         arr_pad = np.pad(arr, ((pad, pad), (0, 0)), mode="edge")
-        sm = np.array([np.mean(arr_pad[i:i + smooth_window], axis=0) for i in range(len(arr))], dtype=np.float64)
+        sm = np.array([np.mean(arr_pad[i:i + smooth_window], axis=0) for i in range(len(arr))])
         for k_id, v in zip(keys, sm):
             meter_disp[k_id] = (float(v[0]), float(v[1]))
-
-    '''
-    # Convert meter displacement -> pixel displacement
-    # Coarse scale:
-    # - lateral: approximately fx * dx / Zref
-    # - forward: approximately fy * dy / Zref (sign adjusted to image y-down convention)
-    # Use Zref from camera height and pitch; keep conservative.
-    calib = load_camera_calibration(calibration_json_path)
-    # 相机的内参矩阵 intrinsic matrix
-    k = calib["K"]
-    fx = float(k[0, 0])
-    fy = float(k[1, 1])
-    h_cam_m = calib["cam_height_mm"] / 1000.0
-    pitch_deg = calib["cam_pitch_deg"]
-    pitch_rad = np.deg2rad(abs(pitch_deg))
-    z_ref = max(8.0, h_cam_m / max(np.tan(max(pitch_rad, np.deg2rad(2.0))), 1e-3))
-
-    undisp = {}
-    for fid, (d_right_m, d_forward_m) in meter_disp.items():
-        dx_u = fx * (d_right_m / z_ref)
-        dy_u = fy * (d_forward_m / z_ref)
-        undisp[int(fid)] = (float(dx_u), float(dy_u))
-    '''
 
     return meter_disp
 
@@ -923,25 +953,31 @@ def compute_pixel_displacement_pie(
         u0, v0 = ref_point_uv
 
     # 从世界坐标系（北东地）转换到第一帧的相机坐标系的旋转矩阵
-    R1 = np.array([[1, 0, 0],
-                   [0, np.cos(th_x := np.deg2rad(90 - cam_pitch_deg)), -np.sin(th_x)],
-                   [0, np.sin(th_x), np.cos(th_x)]])
-    R2 = np.array([[np.cos(th_y := np.deg2rad(90 + heading)), 0, np.sin(th_y)],
-                   [0, 1, 0],
-                   [-np.sin(th_y), 0, np.cos(th_y)]])
-    R3 = np.array([[np.cos(th_y := np.deg2rad(delta_heading)), 0, np.sin(th_y)],
-                   [0, 1, 0],
-                   [-np.sin(th_y), 0, np.cos(th_y)]])
-    R_wc1 = R1 @ R2
-    R_rel = R_wc1 @ R3 @ R_wc1.T  # 从第一帧相机坐标系到当前帧相机坐标系的旋转矩阵
+    Ri = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]])  # ENU to XYZ
+    R_yaw1 = np.array([[np.cos(hd := np.deg2rad(heading)), 0, np.sin(hd)],
+                       [0, 1, 0],
+                       [-np.sin(hd), 0, np.cos(hd)]])
+    R_yaw2 = np.array([[np.cos(dyaw := np.deg2rad(heading + delta_heading)), 0, np.sin(dyaw)],
+                       [0, 1, 0],
+                       [-np.sin(dyaw), 0, np.cos(dyaw)]])
+    R_pitch = np.array([[1, 0, 0],
+                        [0, np.cos(pitch := np.deg2rad(cam_pitch_deg)), -np.sin(pitch)],
+                        [0, np.sin(pitch), np.cos(pitch)]])
+    R_wc1 = R_pitch @ R_yaw1.T @ Ri  # 世界坐标系到第一帧相机坐标系的旋转矩阵
+    R_wc2 = R_pitch @ R_yaw2.T @ Ri  # 世界坐标系到当前帧相机坐标系的旋转矩阵
+    R_rel = R_wc2 @ R_wc1.T  # 第一帧相机坐标系到当前帧相机坐标系的旋转矩阵
 
-    t = np.array([-t_veh[0], -t_veh[1], 0]).reshape(-1, 1)
-    T_rel = R_wc1 @ R3 @ t
+    t = np.array([t_veh[0], t_veh[1], 0]).reshape(-1, 1)
+    T_rel = -R_wc2 @ t
 
     p1 = np.array([u0, v0, 1]).reshape(-1, 1)
     n_w = np.array([0, 0, 1]).reshape(-1, 1)
     n_c1 = R_wc1 @ n_w
-    s1 = cam_height_m / (n_c1.T @ Ki @ p1)
+    # 防止视线与地面平行导致除以0
+    denom = n_c1.T @ Ki @ p1
+    if abs(denom) < 1e-6:
+        return 0.0, 0.0
+    s1 = cam_height_m / denom
 
     p2 = K @ (R_rel @ (s1 * Ki @ p1) + T_rel)
     u1 = p2[0, 0] / p2[2, 0]
@@ -949,49 +985,16 @@ def compute_pixel_displacement_pie(
     return float(u1 - u0), float(v1 - v0)
 
 
-'''
-    # 1. 构造世界到相机坐标系的旋转矩阵（使用 heading, pitch, roll）
-    # R_wc = euler_to_rot_matrix_from_imu(pitch_deg, roll_deg, heading_deg)
-    # TODO: 从世界坐标系（车辆）转换到相机坐标系的旋转矩阵，旋转角为 90 + camera_pitch_deg，绕 x 轴旋转，这里直接硬编码了
-    R_wc = np.array([[1, 0, 0],
-                    [0, np.cos(np.deg2rad(90-cam_pitch_deg)), -np.sin(np.deg2rad(90-cam_pitch_deg))],
-                    [0, np.sin(np.deg2rad(90-cam_pitch_deg)), np.cos(np.deg2rad(90-cam_pitch_deg))]])
-
-    # 2. 地平面在世界坐标系中为 z=0，法向量 n_w = [0,0,1]^T，距离 d = cam_height_m
-    n_world = np.array([0, 0, 1])
-    n_cam = R_wc @ n_world
-    d_cam = cam_height_m
-
-    # 3. 车辆平移转换到相机坐标系
-    t_cam = R_wc @ np.array([t_veh[0], t_veh[1], t_veh[2]])
-
-    # 4. 帧间相对旋转：假设相邻帧姿态变化很小，忽略旋转（R_rel = I）
-    R_rel = np.eye(3)
-
-    # 5. 单应矩阵
-    M = R_rel - (t_cam[:, None] @ n_cam[None, :]) / -d_cam
-    H = K @ M @ Ki
-
-    # 6. 计算参考点位移
-    p0 = np.array([u0, v0, 1.0])
-    p1 = H @ p0
-    u1 = p1[0] / p1[2]
-    v1 = p1[1] / p1[2]
-    return float(u1 - u0), float(v1 - v0)
-'''
-
-
 def build_camera_displacements_corrected(
         vehicle_annotations: Dict[int, Dict[str, float]],
         calibration_json_path: str,
         max_speed_mps: float = 35.0,
         smooth_window: int = 5
-) -> Dict[int, Tuple[float, float]]:
+) -> Dict[int, Dict[str, float]]:
     """
-    修正版本：正确使用物理位移 + 姿态角计算像素位移。
-    输出格式与原函数一致：{frame_id: (dx_px, dy_px)}
+    修正版本：输出逐帧北/东方向物理位移（米）与 heading，平滑处理保留。
+    输出格式：{frame_id: {"d_north_m": ..., "d_east_m": ..., "heading": ...}}
     """
-    # ---- 数据解析部分（与原函数相同） ----
     if not vehicle_annotations:
         raise ValueError("Missing vehicle annotations")
 
@@ -1008,14 +1011,11 @@ def build_camera_displacements_corrected(
         speed = min(max(speed, 0.0), max_speed_mps)
 
         heading = _normalize_heading_deg(_safe_float(r.get("heading_angle", 0.0), 0.0))
-        # 假设标注中也有 pitch, roll
         pitch = _safe_float(r.get("pitch", 0.0), 0.0)
         roll = _safe_float(r.get("roll", 0.0), 0.0)
 
-        lat = r.get("latitude", None)
-        lon = r.get("longitude", None)
-        lat = None if lat is None else _safe_float(lat, None)
-        lon = None if lon is None else _safe_float(lon, None)
+        lat = _safe_optional_float(r.get("latitude", None))
+        lon = _safe_optional_float(r.get("longitude", None))
 
         rows.append({
             "fid": fid,
@@ -1027,8 +1027,6 @@ def build_camera_displacements_corrected(
             "lon": lon
         })
 
-    # ---- 计算相邻帧间的车辆坐标系位移 (d_right, d_forward) ----
-    # 原函数中这部分逻辑保留，但要注意它已经用了 heading 旋转世界位移到车辆系。
     valid_geo = [(r["lat"], r["lon"]) for r in rows if r["lat"] is not None and r["lon"] is not None]
     lat0, lon0 = valid_geo[0] if valid_geo else (None, None)
 
@@ -1037,100 +1035,63 @@ def build_camera_displacements_corrected(
     if lat0 is not None and prev["lat"] is not None and prev["lon"] is not None:
         prev_xy = _latlon_to_local_xy_m(prev["lat"], prev["lon"], lat0, lon0)
 
-    meter_disp = {}  # fid -> (d_right_m, d_forward_m)
+    meter_disp = {}  # fid -> {d_north_m, d_east_m, heading}
     for i in range(1, len(rows)):
         cur = rows[i]
-        # d_forward, d_right = 0.0, 0.0
         dx_n, dy_e = 0.0, 0.0
 
-        # 1) 尝试用 GPS 计算位移（世界坐标系 ENU）
         if (lat0 is not None and prev["lat"] is not None and prev["lon"] is not None
                 and cur["lat"] is not None and cur["lon"] is not None):
             cur_xy = _latlon_to_local_xy_m(cur["lat"], cur["lon"], lat0, lon0)
-            dy_e = cur_xy[0] - prev_xy[0]  # 东
-            dx_n = cur_xy[1] - prev_xy[1]  # 北
-
-            # 用前一帧 heading 将 ENU 位移旋转到车辆坐标系
-            '''hd = np.deg2rad(prev["heading"])
-            fwd_x_e, fwd_y_n = np.sin(hd), np.cos(hd)   # 北为0°，顺时针增加
-            right_x_e, right_y_n = np.cos(hd), -np.sin(hd)
-
-            d_forward = dx_e * fwd_x_e + dy_n * fwd_y_n
-            d_right = dx_e * right_x_e + dy_n * right_y_n'''
+            dy_e = cur_xy[0] - prev_xy[0]
+            dx_n = cur_xy[1] - prev_xy[1]
             prev_xy = cur_xy
         else:
-            # 2) 无 GPS，用速度积分
-            d_forward = prev["speed"] / 3.6 / 30.0  # 假设 30fps
+            d_forward = prev["speed"] / 3.6 / 30.0
             d_right = 0.0
+            hd = np.deg2rad(prev["heading"])
+            dx_n = d_forward * np.cos(hd) - d_right * np.sin(hd)
+            dy_e = d_forward * np.sin(hd) + d_right * np.cos(hd)
 
-        # meter_disp[cur["fid"]] = (float(d_right), float(d_forward))
-        meter_disp[cur["fid"]] = (float(dx_n), float(dy_e))
+        meter_disp[cur["fid"]] = {
+            "d_north_m": float(dx_n),
+            "d_east_m": float(dy_e),
+            "heading": float(prev["heading"]),
+        }
         prev = cur
 
-    # ---- 平滑处理（可选） ----
+    # Smooth meter displacement (simple moving average)，数据平滑，避免单帧异常值对后续像素位移计算的过大影响；
+    # 平滑窗口过大会过度模糊，过小则无法有效抑制噪声
     if smooth_window > 1 and len(meter_disp) >= 3:
         keys = sorted(meter_disp.keys())
-        arr = np.array([meter_disp[k] for k in keys], dtype=np.float64)
+        arr = np.array([[meter_disp[k]["d_north_m"], meter_disp[k]["d_east_m"]] for k in keys], dtype=np.float64)
         pad = smooth_window // 2
         arr_pad = np.pad(arr, ((pad, pad), (0, 0)), mode="edge")
         sm = np.array([np.mean(arr_pad[i:i + smooth_window], axis=0) for i in range(len(arr))])
         for k_id, v in zip(keys, sm):
-            meter_disp[k_id] = (float(v[0]), float(v[1]))
+            meter_disp[k_id]["d_north_m"] = float(v[0])
+            meter_disp[k_id]["d_east_m"] = float(v[1])
 
-    # ---- 加载相机参数 ----
-    calib = load_camera_calibration(calibration_json_path)
-    K = calib["K"]
-    Ki = np.linalg.inv(K)
-    cam_height_m = calib["cam_height_mm"] / 1000.0
-    cam_pitch_deg = np.deg2rad(calib["cam_pitch_deg"])
-
-    # ---- 计算每帧的像素位移（使用修正后的方法） ----
-    undisp = {}
-    for fid, (d_north, d_east) in meter_disp.items():
-        # 获取当前帧的姿态（如果每帧都有）
-        cur_row = next((r for r in rows if r["fid"] == fid), None)
-        if cur_row is None:
-            continue
-
-        # 车辆坐标系平移（无垂直位移）
-        # t_veh = np.array([d_right, d_forward, 0.0])
-        t_veh = np.array([d_north, d_east, 0.0])
-
-        du, dv = compute_pixel_displacement_pie(
-            t_veh=t_veh,
-            heading=rows[fid - 1]['heading'],
-            delta_heading=rows[fid]['heading'] - rows[fid - 1]['heading'],
-            cam_pitch_deg=cam_pitch_deg,
-            K=K,
-            Ki=Ki,
-            cam_height_m=cam_height_m,  #
-            ref_point_uv=(1755, 832)  #   # TODO: 修改为行人轨迹的初始边界框的右下坐标  1312, 823  1439,810  207,846
-        )
-
-        undisp[int(fid)] = (du, dv)
-
-    return undisp
+    return meter_disp
 
 
 def get_pedestrian_real_displacement_endpoints(
         ped_track: Dict[str, Any],
-        camera_displacements: Dict[int, Tuple[float, float]],
+        camera_displacements: Dict[int, Dict[str, float]],
         calibration_json_path: str,
 ) -> Dict[str, Any]:
     """
     输入：ped_track 一个行人的轨迹
-         camera_displacements 相机的所有逐帧物理位移
+         camera_displacements 相机的所有逐帧北/东方向物理位移及 heading
          calibration_json_path 相机参数文件路径
-    仅首尾点（省算力）:
-      1) 首尾行人质心去畸变
-      2) 累积同时间段相机逐帧位移（无畸变域）
-      3) 相减得到相对道路位移
     """
-    # TODO: 后续打算给相机位移也增加首尾可选项，但目前先默认从第一帧开始累积，直到轨迹结束（如果中间有缺帧，则补0），以保证相机位移的完整性
     frame_nums = [int(f) for f in ped_track.get("frame_nums", [])]
     cents = ped_track.get("centroids", [])
+    boxes = ped_track.get("boxes", [])
     if len(frame_nums) != len(cents):
         raise ValueError(f"轨迹帧数和位置数不一致: frames={len(frame_nums)}, centroids={len(cents)}")
+    if boxes and len(boxes) != len(frame_nums):
+        raise ValueError(f"轨迹框数和帧数不一致: frames={len(frame_nums)}, boxes={len(boxes)}")
 
     s_f, e_f = frame_nums[0], frame_nums[-1]
     s_p = np.array(cents[0], dtype=np.float64).reshape(1, 2)
@@ -1138,40 +1099,116 @@ def get_pedestrian_real_displacement_endpoints(
 
     calib = load_camera_calibration(calibration_json_path)
     k, d = calib["K"], calib["D"]
+    cam_height_m = calib["cam_height_mm"] / 1000.0
+    cam_pitch_deg = calib["cam_pitch_deg"]
+    Ki = np.linalg.inv(k)
 
     s_u = _undistorted_points_to_pixel(s_p, k, d)[0]
     e_u = _undistorted_points_to_pixel(e_p, k, d)[0]
 
-    # 相机按帧累积（支持轨迹从任意帧开始；有时候车辆标注信息可能不完整，缺帧补0）
     low, high = min(s_f, e_f), max(s_f, e_f)
+    idx_by_frame = {int(f): i for i, f in enumerate(frame_nums)}
+
     cam_dx, cam_dy = 0.0, 0.0
+    camera_dx_px = 0.0
+    camera_dy_px = 0.0
+
     for f in range(low + 1, high + 1):
-        dxy = camera_displacements.get(f, (0.0, 0.0))
-        cam_dx += float(dxy[0])
-        cam_dy += float(dxy[1])
+        dxy = camera_displacements.get(f, {"d_north_m": 0.0, "d_east_m": 0.0, "heading": 0.0})
+        prev_dxy = camera_displacements.get(f - 1, {"heading": 0.0})
+        heading = float(prev_dxy.get("heading", 0.0))
+        delta_heading = float(dxy.get("heading", heading)) - heading
+
+        cam_dx += float(dxy.get("d_north_m", 0.0))
+        cam_dy += float(dxy.get("d_east_m", 0.0))
+
+        # 每一帧都用该帧行人框的“底部中心”作为参考点
+        idx = idx_by_frame.get(f, idx_by_frame.get(f - 1, 0))
+        ref_point_uv = None
+        if boxes and 0 <= idx < len(boxes) and len(boxes[idx]) == 4:
+            xtl, ytl, xbr, ybr = [float(v) for v in boxes[idx]]
+            ref_point_uv = ((xtl + xbr) * 0.5, ybr)
+        if ref_point_uv is None:
+            # 无框时退化到该帧中心点（或最近帧）
+            cp = cents[idx] if 0 <= idx < len(cents) else cents[0]
+            ref_point_uv = (float(cp[0]), float(cp[1]))
+
+        t_veh = np.array([float(dxy.get("d_north_m", 0.0)), float(dxy.get("d_east_m", 0.0)), 0.0])
+        du, dv = compute_pixel_displacement_pie(
+            t_veh=t_veh,
+            heading=heading,
+            delta_heading=delta_heading,
+            cam_pitch_deg=cam_pitch_deg,
+            K=k,
+            Ki=Ki,
+            cam_height_m=cam_height_m,
+            ref_point_uv=ref_point_uv,
+        )
+        camera_dx_px += du
+        camera_dy_px += dv
+
     if e_f < s_f:
         cam_dx *= -1.0
         cam_dy *= -1.0
+        camera_dx_px *= -1.0
+        camera_dy_px *= -1.0
 
     ped_dx = float(e_u[0] - s_u[0])
     ped_dy = float(e_u[1] - s_u[1])
 
-    rel_dx = ped_dx - cam_dx
-    rel_dy = ped_dy - cam_dy
+    rel_dx = ped_dx - camera_dx_px
+    rel_dy = ped_dy - camera_dy_px
+
+    # 仅保留调试必要字段，不再输出 frame_range
+    ref_start_uv = None
+    if boxes and len(boxes[0]) == 4:
+        xtl, ytl, xbr, ybr = [float(v) for v in boxes[0]]
+        ref_start_uv = ((xtl + xbr) * 0.5, ybr)
+    if ref_start_uv is None:
+        ref_start_uv = (float(s_p[0, 0]), float(s_p[0, 1]))
 
     return {
         "start_frame": s_f,
         "end_frame": e_f,
+        "ped_start_raw": [float(s_p[0, 0]), float(s_p[0, 1])],
+        "ped_end_raw": [float(e_p[0, 0]), float(e_p[0, 1])],
         "ped_start_und": [float(s_u[0]), float(s_u[1])],
         "ped_end_und": [float(e_u[0]), float(e_u[1])],
+        "ref_point_uv": [float(ref_start_uv[0]), float(ref_start_uv[1])],
         "camera_delta_und": [float(cam_dx), float(cam_dy)],
+        "camera_delta_px": [float(camera_dx_px), float(camera_dy_px)],
         "relative_displacement_und": [float(rel_dx), float(rel_dy)],
     }
 
 
+def debug_validate_stationary_tracks(
+        track_histories: Dict[int, Dict[str, Any]],
+        camera_displacements: Dict[int, Dict[str, float]],
+        calibration_json_path: str,
+        max_abs_disp_px: float = 20.0,
+) -> List[Tuple[int, Dict[str, Any]]]:
+    """Return tracks whose estimated relative displacement is unexpectedly large."""
+    suspicious = []
+    for track_id, track_data in track_histories.items():
+        try:
+            checkpoint = get_pedestrian_real_displacement_endpoints(
+                ped_track=track_data,
+                camera_displacements=camera_displacements,
+                calibration_json_path=calibration_json_path,
+            )
+        except Exception as exc:
+            suspicious.append((track_id, {"error": str(exc)}))
+            continue
+
+        rel_dx, rel_dy = checkpoint["relative_displacement_und"]
+        if abs(rel_dx) > max_abs_disp_px or abs(rel_dy) > max_abs_disp_px:
+            suspicious.append((track_id, checkpoint))
+    return suspicious
+
+
 def determine_intent(
         ped_track: Dict[str, Any],
-        camera_displacements_undistorted: Dict[int, Tuple[float, float]],
+        camera_displacements_undistorted: Dict[int, Dict[str, float]],
         calibration_json_path: str,
         motion_threshold: float = 0.15) -> Tuple[List[str], Dict[str, Any]]:
     """
@@ -1437,17 +1474,21 @@ def test_camera_motion(json_path):
 
 
 def test_intent_from_track(json_path, vehicle_path, calibration_json_path):
-    # 先尝试只对一个行人的意图进行分析
     all_tracks = load_json(json_path)
-    obj = all_tracks['5489']
+    track_items = list(all_tracks.items())[:20]
 
     vehicle = parse_vehicle(vehicle_path)
     camera = build_camera_displacements_corrected(vehicle, calibration_json_path)
-    # save_results_to_json(camera, r"camera_displacements.json")
 
-    intent, checkpoint = determine_intent(obj, camera, calibration_json_path, motion_threshold=0.15)
-    print(intent)
-    print(checkpoint)
+    checkpoints = {}
+
+    for track_id, obj in track_items:
+        intent, checkpoint = determine_intent(obj, camera, calibration_json_path, motion_threshold=0.15)
+        print(f"track_id={track_id}")
+        print(checkpoint)
+        checkpoints[str(track_id)] = checkpoint
+
+    save_checkpoints_to_excel(checkpoints, "intent_checkpoints.xlsx")
 
 
 if __name__ == "__main__":
