@@ -103,8 +103,12 @@ def parse_pedestrians(anno_path: str) -> Dict[str, Dict[str, Any]]:
         boxes_data = []
         frames = []
 
-        for box in track.findall('box'):
-            # 获取 frame 和坐标
+        boxes = track.findall('box')
+        n = len(boxes)
+        target_idxs = {0, n // 2, n - 1} if n > 0 else set()
+        target_state = {}  # idx -> (cross, action)
+
+        for i, box in enumerate(boxes):
             frame = int(box.get('frame'))
             xtl = float(box.get('xtl'))
             ytl = float(box.get('ytl'))
@@ -112,6 +116,14 @@ def parse_pedestrians(anno_path: str) -> Dict[str, Dict[str, Any]]:
             ybr = float(box.get('ybr'))
             boxes_data.append([xtl, ytl, xbr, ybr])
             frames.append(frame)
+
+            # 如果首尾+中间帧都为不过街+站立，那么就认为他的方向意图是['s', 's']，尽管对方实际可能的意图是其他，我们的意图是根据最终落脚点判定的
+            if i in target_idxs:
+                cross_attr = box.find("attribute[@name='cross']")
+                action_attr = box.find("attribute[@name='action']")
+                cross = (cross_attr.text or "").strip() if cross_attr is not None else ""
+                action = (action_attr.text or "").strip() if action_attr is not None else ""
+                target_state[i] = (cross, action)
 
         # 获取 id（通常第一个 box 的 attribute 中包含）
         first_box = track.find('box')
@@ -126,6 +138,10 @@ def parse_pedestrians(anno_path: str) -> Dict[str, Dict[str, Any]]:
             "boxes": boxes_data,
             "frame_nums": frames
         }
+
+        if all(target_state[i] == ("not-crossing", "standing") for i in target_idxs):
+            pedestrians[ped_id]["dir_intent"] = ['s', 's']
+            print(f"{ped_id}的意图已确定，为['s','s']")
 
     return pedestrians
 
@@ -159,7 +175,31 @@ def parse_vehicle(vehicle_path: str) -> Dict[int, Dict[str, float]]:
     return vehicle
 
 
-def save_xml_annotation(anno_path, output_root, track_histories, matches):
+def load_camera_calibration(calibration_json_path: str) -> Dict[str, Any]:
+    """从 JSON 文件中加载相机内参和相关信息"""
+    calib = load_json(calibration_json_path)
+    k = np.array(calib.get("K", []), dtype=np.float64)
+    if k.shape != (3, 3):
+        raise ValueError(f"Invalid K shape: {k.shape}")
+
+    d_raw = np.array(calib.get("D", []), dtype=np.float64).reshape(-1)
+    if d_raw.size not in (4, 5, 8):
+        raise ValueError(f"Invalid D length: {d_raw.size}, expected 4/5/8")
+
+    dim = calib.get("dim", [1920, 1080])
+    if not isinstance(dim, list) or len(dim) != 2:
+        dim = [1920, 1080]
+
+    return {
+        "K": k,
+        "D": d_raw,
+        "dim": (int(dim[0]), int(dim[1])),
+        "cam_height_mm": _safe_float(calib.get("cam_height_mm", 1270.0), 1270.0),
+        "cam_pitch_deg": _safe_float(calib.get("cam_pitch_deg", -10.0), -10.0),
+    }
+
+
+def save_xml_annotation(anno_path, output_root, track_histories, matches, unmatch):
     """向标注文件中添加新的行人及方向意图"""
 
     # 解析 XML 文件
@@ -172,7 +212,7 @@ def save_xml_annotation(anno_path, output_root, track_histories, matches):
     id_max = 0
     ped_id = None
 
-    # 对匹配好了的轨迹添加 dir_intent
+    # 对 GT 添加 dir_intent
     for track in root.findall('track'):
         if track.get('label') != 'pedestrian':
             continue
@@ -184,8 +224,14 @@ def save_xml_annotation(anno_path, output_root, track_histories, matches):
                 continue
             ped_id = id_attr.text
 
-            if ped_id not in match_intent:
-                continue
+            if ped_id in match_intent:
+                intent = match_intent[ped_id]
+            else:
+                if ped_id in unmatch:
+                    intent = unmatch[ped_id]
+                else:
+                    raise ValueError(f"{ped_id}缺失对应意图标签")
+
 
             # 检查是否已存在 dir_intent 属性，若存在则先移除（避免重复）
             existing = box.find("attribute[@name='dir_intent']")
@@ -195,7 +241,7 @@ def save_xml_annotation(anno_path, output_root, track_histories, matches):
             # 添加新属性
             attr = ET.SubElement(box, 'attribute')
             attr.set('name', 'dir_intent')
-            attr.text = ', '.join(match_intent[ped_id])
+            attr.text = ', '.join(intent)
 
         id_max = int(ped_id.split('_')[-1]) if int(ped_id.split('_')[-1]) > id_max else id_max
 
@@ -709,6 +755,8 @@ def match_objects(tracks, inputs, iou_thresh=0.3, min_overlap_frames=5):
     if not tracks or not inputs:
         raise ValueError("没有轨迹或者输入")
 
+    tracks.pop("camera", None)
+
     track_ids = list(tracks.keys())
     input_ids = list(inputs.keys())
     # prepare data
@@ -788,29 +836,6 @@ def _safe_optional_float(v):
         return None
 
 
-def load_camera_calibration(calibration_json_path: str) -> Dict[str, Any]:
-    calib = load_json(calibration_json_path)
-    k = np.array(calib.get("K", []), dtype=np.float64)
-    if k.shape != (3, 3):
-        raise ValueError(f"Invalid K shape: {k.shape}")
-
-    d_raw = np.array(calib.get("D", []), dtype=np.float64).reshape(-1)
-    if d_raw.size not in (4, 5, 8):
-        raise ValueError(f"Invalid D length: {d_raw.size}, expected 4/5/8")
-
-    dim = calib.get("dim", [1920, 1080])
-    if not isinstance(dim, list) or len(dim) != 2:
-        dim = [1920, 1080]
-
-    return {
-        "K": k,
-        "D": d_raw,
-        "dim": (int(dim[0]), int(dim[1])),
-        "cam_height_mm": _safe_float(calib.get("cam_height_mm", 1270.0), 1270.0),
-        "cam_pitch_deg": _safe_float(calib.get("cam_pitch_deg", -10.0), -10.0),
-    }
-
-
 # 传进来一组图像坐标系下的点（矩阵），返回去畸变后的图像坐标系下的点（矩阵）
 def _undistorted_points_to_pixel(points_xy: np.ndarray, k: np.ndarray, d: np.ndarray) -> np.ndarray:
     """
@@ -823,116 +848,6 @@ def _undistorted_points_to_pixel(points_xy: np.ndarray, k: np.ndarray, d: np.nda
     else:
         und = cv2.undistortPoints(pts, k, d.reshape(-1, 1), P=k)
     return und.reshape(-1, 2)
-
-
-# 这里是在计算畸变体系下的相邻两帧之间的相机位移
-def build_camera_displacements(
-        vehicle_annotations: Dict[int, Dict[str, float]],
-        calibration_json_path: str,
-        max_speed_mps: float = 35.0,
-        smooth_window: int = 5) -> Dict[int, Tuple[float, float]]:
-    """
-    Build per-frame camera displacement in pixel space from PIE vehicle annotations.
-
-    Input:
-        vehicle_annotations:
-            dict keyed by frame id (string/int), each value with possible keys:
-            GPS_speed, OBD_speed, heading_angle, latitude, longitude.
-        video_path: to estimate FPS and dt.
-        calibration_json_path: path to calibration_data.json.
-    Output:
-        {frame_idx: (dx_px, dy_px)}  where frame_idx is current frame id,
-        and displacement corresponds roughly to prev_frame -> current_frame motion.
-
-    Notes:
-        - Robust to missing tail frames: outputs only available IDs; callers can forward-fill zeros.
-        - Robust to missing lat/lon: fallback to speed+heading integration.
-        - Uses K/fx/fy + camera height/pitch for a coarse ground-plane scale (annotation-grade accuracy).
-    输出: {frame_id: (dx_u, dy_u)}，北向(x)和东向(y)的物理位移。
-    """
-    if not vehicle_annotations:
-        raise ValueError("Missing vehicle annotations")
-
-    # Sort by frame id (id is frame index per your note)
-    frame_ids = sorted(int(x) for x in vehicle_annotations.keys())
-    if len(frame_ids) < 2:
-        return {}
-
-    # Pre-read rows，获取用来计算相机运动的参数
-    rows = []
-    for fid in frame_ids:
-        # 从 vehicle_annotations 里取当前帧 fid 对应的标注行
-        r = vehicle_annotations.get(fid, {})
-        gps_speed = _safe_float(r.get("GPS_speed", 0.0), 0.0)
-        obd_speed = _safe_float(r.get("OBD_speed", 0.0), 0.0)
-        speed = gps_speed if gps_speed > 1e-3 else obd_speed
-        speed = min(max(speed, 0.0), max_speed_mps)
-
-        heading = _normalize_heading_deg(_safe_float(r.get("heading_angle", 0.0), 0.0))
-        lat = _safe_optional_float(r.get("latitude", None))
-        lon = _safe_optional_float(r.get("longitude", None))
-
-        rows.append({"fid": fid, "speed": speed, "heading": heading, "lat": lat, "lon": lon})
-
-    # Reference for local XY，专门把经纬度提取出来
-    valid_geo = [(r["lat"], r["lon"]) for r in rows if r["lat"] is not None and r["lon"] is not None]
-    lat0, lon0 = valid_geo[0] if valid_geo else (None, None)
-
-    prev = rows[0]
-    prev_xy = None
-    if lat0 is not None and prev["lat"] is not None and prev["lon"] is not None:
-        prev_xy = _latlon_to_local_xy_m(prev["lat"], prev["lon"], lat0, lon0)
-
-    # Build meter displacement in vehicle-forward/lateral approx
-    meter_disp = {}  # fid -> (d_right_m, d_forward_m), from prev->curr
-    for i in range(1, len(rows)):
-        cur = rows[i]
-        # d_forward, d_right = 0.0, 0.0
-        dx_n, dy_e = 0.0, 0.0
-
-        # 1) Try geo delta first
-        if (lat0 is not None and prev["lat"] is not None and prev["lon"] is not None
-                and cur["lat"] is not None and cur["lon"] is not None):
-            cur_xy = _latlon_to_local_xy_m(cur["lat"], cur["lon"], lat0, lon0)
-            dy_e = cur_xy[0] - prev_xy[0]  # east
-            dx_n = cur_xy[1] - prev_xy[1]  # north
-
-            '''
-            # Rotate world EN to vehicle frame using previous heading，坐标系变换
-            # heading: 0=north, 90=east
-            hd = np.deg2rad(prev["heading"])
-            fwd_x_e, fwd_y_n = np.sin(hd), np.cos(hd)
-            right_x_e, right_y_n = np.cos(hd), -np.sin(hd)
-
-            d_forward = dx_e * fwd_x_e + dy_n * fwd_y_n
-            d_right = dx_e * right_x_e + dy_n * right_y_n'''
-            prev_xy = cur_xy
-        else:
-            # 2) Fallback to speed * dt and heading change ignored for translation decomposition
-            # 速度单位是 km/h，转换成 m/s 需要除以 3.6；再除以帧率（30）得到每帧的位移
-            d_forward = prev["speed"] / 3.6 / 30.0
-            d_right = 0.0
-
-            # heading 是相对于正北的角度，顺时针增加
-            hd = np.deg2rad(prev["heading"])
-            dx_n = d_forward * np.cos(hd) - d_right * np.sin(hd)
-            dy_e = d_forward * np.sin(hd) + d_right * np.cos(hd)
-
-        meter_disp[cur["fid"]] = (float(dx_n), float(dy_e))
-        prev = cur
-
-    # Smooth meter displacement (simple moving average)，数据平滑，避免单帧异常值对后续像素位移计算的过大影响；
-    # 平滑窗口过大会过度模糊，过小则无法有效抑制噪声
-    if smooth_window > 1 and len(meter_disp) >= 3:
-        keys = sorted(meter_disp.keys())
-        arr = np.array([meter_disp[k] for k in keys], dtype=np.float64)
-        pad = smooth_window // 2
-        arr_pad = np.pad(arr, ((pad, pad), (0, 0)), mode="edge")
-        sm = np.array([np.mean(arr_pad[i:i + smooth_window], axis=0) for i in range(len(arr))])
-        for k_id, v in zip(keys, sm):
-            meter_disp[k_id] = (float(v[0]), float(v[1]))
-
-    return meter_disp
 
 
 def compute_pixel_displacement_pie(
@@ -1084,18 +999,21 @@ def get_pedestrian_real_displacement_endpoints(
     输入：ped_track 一个行人的轨迹
          camera_displacements 相机的所有逐帧北/东方向物理位移及 heading
          calibration_json_path 相机参数文件路径
+
+    说明：
+    - 行人位移采用“逐帧积分”，不是首尾差
+    - 每帧参考点固定为该帧 bbox 底部中心
     """
     frame_nums = [int(f) for f in ped_track.get("frame_nums", [])]
-    cents = ped_track.get("centroids", [])
+    # cents = ped_track.get("centroids", [])
     boxes = ped_track.get("boxes", [])
-    if len(frame_nums) != len(cents):
-        raise ValueError(f"轨迹帧数和位置数不一致: frames={len(frame_nums)}, centroids={len(cents)}")
+
+    if not frame_nums:
+        raise ValueError("空轨迹：frame_nums 为空")
     if boxes and len(boxes) != len(frame_nums):
         raise ValueError(f"轨迹框数和帧数不一致: frames={len(frame_nums)}, boxes={len(boxes)}")
-
-    s_f, e_f = frame_nums[0], frame_nums[-1]
-    s_p = np.array(cents[0], dtype=np.float64).reshape(1, 2)
-    e_p = np.array(cents[-1], dtype=np.float64).reshape(1, 2)
+    # if (not boxes) and len(cents) != len(frame_nums):
+    #     raise ValueError(f"轨迹帧数和位置数不一致: frames={len(frame_nums)}, centroids={len(cents)}")
 
     calib = load_camera_calibration(calibration_json_path)
     k, d = calib["K"], calib["D"]
@@ -1103,37 +1021,73 @@ def get_pedestrian_real_displacement_endpoints(
     cam_pitch_deg = calib["cam_pitch_deg"]
     Ki = np.linalg.inv(k)
 
-    s_u = _undistorted_points_to_pixel(s_p, k, d)[0]
-    e_u = _undistorted_points_to_pixel(e_p, k, d)[0]
+    # 组装每帧像素参考点：优先 bbox 底部中心；无 bbox 时退化到 centroid
+    pts_by_frame = {}
+    for i, f in enumerate(frame_nums):
+        if boxes and i < len(boxes) and len(boxes[i]) == 4:
+            xtl, ytl, xbr, ybr = [float(v) for v in boxes[i]]
+            pts_by_frame[f] = np.array([(xtl + xbr) * 0.5, ybr], dtype=np.float64)
+        # else:
+        #     cp = cents[i]
+        #     pts_by_frame[f] = np.array([float(cp[0]), float(cp[1])], dtype=np.float64)
 
-    low, high = min(s_f, e_f), max(s_f, e_f)
-    idx_by_frame = {int(f): i for i, f in enumerate(frame_nums)}
+    # 按时间顺序对轨迹积分；若有重复帧，只保留第一次出现
+    ordered_frames = sorted(set(frame_nums))
+    if len(ordered_frames) < 2:
+        f0 = ordered_frames[0]
+        p0 = pts_by_frame[f0].reshape(1, 2)
+        p0u = _undistorted_points_to_pixel(p0, k, d)[0]
+        return {
+            "p_raw": [float(p0[0, 0]), float(p0[0, 1])],
+            "p_und": [float(p0u[0]), float(p0u[1])],
+            "c_mt": [0.0, 0.0],  # 兼容旧字段名
+            "c_px": [0.0, 0.0],
+            "r": [0.0, 0.0],  # determine_intent 读取这个键
+            "frame_nums": 1
+        }
 
-    cam_dx, cam_dy = 0.0, 0.0
-    camera_dx_px = 0.0
-    camera_dy_px = 0.0
+    # 起止帧与起止点（仅用于记录）
+    s_f, e_f = ordered_frames[0], ordered_frames[-1]
+    # s_p = pts_by_frame[s_f].reshape(1, 2)
+    # e_p = pts_by_frame[e_f].reshape(1, 2)
+    # s_u = _undistorted_points_to_pixel(s_p, k, d)[0]
+    # e_u = _undistorted_points_to_pixel(e_p, k, d)[0]
 
-    for f in range(low + 1, high + 1):
-        dxy = camera_displacements.get(f, {"d_north_m": 0.0, "d_east_m": 0.0, "heading": 0.0})
-        prev_dxy = camera_displacements.get(f - 1, {"heading": 0.0})
+    # 逐帧积分
+    ped_dx, ped_dy = 0.0, 0.0
+    # ped_dx_und = 0.0
+    # ped_dy_und = 0.0
+    # cam_dx_m = 0.0
+    # cam_dy_m = 0.0
+    cam_dx_px = 0.0
+    cam_dy_px = 0.0
+
+    for prev_f, cur_f in zip(ordered_frames[:-1], ordered_frames[1:]):
+        # 行人逐帧像素位移（畸变体系）
+        ped_dx += float(pts_by_frame[cur_f][0] - pts_by_frame[prev_f][0])
+        ped_dy += float(pts_by_frame[cur_f][1] - pts_by_frame[prev_f][1])
+
+        # 行人逐帧像素位移（去畸变后）
+        # prev_u = _undistorted_points_to_pixel(pts_by_frame[prev_f].reshape(1, 2), k, d)[0]
+        # cur_u = _undistorted_points_to_pixel(pts_by_frame[cur_f].reshape(1, 2), k, d)[0]
+        # ped_dx_und += float(cur_u[0] - prev_u[0])
+        # ped_dy_und += float(cur_u[1] - prev_u[1])
+
+        # 相机位移累加（物理量仅做记录）
+        dxy = camera_displacements.get(cur_f, {"d_north_m": 0.0, "d_east_m": 0.0, "heading": 0.0})
+        prev_dxy = camera_displacements.get(prev_f, {"heading": 0.0})
+
+        dn = float(dxy.get("d_north_m", 0.0))
+        de = float(dxy.get("d_east_m", 0.0))
         heading = float(prev_dxy.get("heading", 0.0))
         delta_heading = float(dxy.get("heading", heading)) - heading
 
-        cam_dx += float(dxy.get("d_north_m", 0.0))
-        cam_dy += float(dxy.get("d_east_m", 0.0))
+        # cam_dx_m += dn
+        # am_dy_m += de
 
-        # 每一帧都用该帧行人框的“底部中心”作为参考点
-        idx = idx_by_frame.get(f, idx_by_frame.get(f - 1, 0))
-        ref_point_uv = None
-        if boxes and 0 <= idx < len(boxes) and len(boxes[idx]) == 4:
-            xtl, ytl, xbr, ybr = [float(v) for v in boxes[idx]]
-            ref_point_uv = ((xtl + xbr) * 0.5, ybr)
-        if ref_point_uv is None:
-            # 无框时退化到该帧中心点（或最近帧）
-            cp = cents[idx] if 0 <= idx < len(cents) else cents[0]
-            ref_point_uv = (float(cp[0]), float(cp[1]))
-
-        t_veh = np.array([float(dxy.get("d_north_m", 0.0)), float(dxy.get("d_east_m", 0.0)), 0.0])
+        # 相机像素补偿：用当前帧行人底部中心作为参考点
+        ref_uv = pts_by_frame[cur_f]
+        t_veh = np.array([dn, de, 0.0], dtype=np.float64)
         du, dv = compute_pixel_displacement_pie(
             t_veh=t_veh,
             heading=heading,
@@ -1142,75 +1096,27 @@ def get_pedestrian_real_displacement_endpoints(
             K=k,
             Ki=Ki,
             cam_height_m=cam_height_m,
-            ref_point_uv=ref_point_uv,
+            ref_point_uv=(float(ref_uv[0]), float(ref_uv[1])),
         )
-        camera_dx_px += du
-        camera_dy_px += dv
+        cam_dx_px += float(du)
+        cam_dy_px += float(dv)
 
-    if e_f < s_f:
-        cam_dx *= -1.0
-        cam_dy *= -1.0
-        camera_dx_px *= -1.0
-        camera_dy_px *= -1.0
-
-    ped_dx = float(e_u[0] - s_u[0])
-    ped_dy = float(e_u[1] - s_u[1])
-
-    rel_dx = ped_dx - camera_dx_px
-    rel_dy = ped_dy - camera_dy_px
-
-    # 仅保留调试必要字段，不再输出 frame_range
-    ref_start_uv = None
-    if boxes and len(boxes[0]) == 4:
-        xtl, ytl, xbr, ybr = [float(v) for v in boxes[0]]
-        ref_start_uv = ((xtl + xbr) * 0.5, ybr)
-    if ref_start_uv is None:
-        ref_start_uv = (float(s_p[0, 0]), float(s_p[0, 1]))
+    rel_dx = ped_dx - cam_dx_px
+    rel_dy = ped_dy - cam_dy_px
 
     return {
-        "start_frame": s_f,
-        "end_frame": e_f,
-        "ped_start_raw": [float(s_p[0, 0]), float(s_p[0, 1])],
-        "ped_end_raw": [float(e_p[0, 0]), float(e_p[0, 1])],
-        "ped_start_und": [float(s_u[0]), float(s_u[1])],
-        "ped_end_und": [float(e_u[0]), float(e_u[1])],
-        "ref_point_uv": [float(ref_start_uv[0]), float(ref_start_uv[1])],
-        "camera_delta_und": [float(cam_dx), float(cam_dy)],
-        "camera_delta_px": [float(camera_dx_px), float(camera_dy_px)],
-        "relative_displacement_und": [float(rel_dx), float(rel_dy)],
+        "p_raw": [float(ped_dx), float(ped_dy)],  # 行人原始像素位移（畸变体系）
+        # "c_mt": [float(cam_dx_m),float(cam_dy_m)],
+        # "c_px": [float(cam_dx_px), float(cam_dy_px)],
+        "r": [float(rel_dx), float(rel_dy)],  # 相对像素位移
+        "frame_nums": e_f - s_f
     }
-
-
-def debug_validate_stationary_tracks(
-        track_histories: Dict[int, Dict[str, Any]],
-        camera_displacements: Dict[int, Dict[str, float]],
-        calibration_json_path: str,
-        max_abs_disp_px: float = 20.0,
-) -> List[Tuple[int, Dict[str, Any]]]:
-    """Return tracks whose estimated relative displacement is unexpectedly large."""
-    suspicious = []
-    for track_id, track_data in track_histories.items():
-        try:
-            checkpoint = get_pedestrian_real_displacement_endpoints(
-                ped_track=track_data,
-                camera_displacements=camera_displacements,
-                calibration_json_path=calibration_json_path,
-            )
-        except Exception as exc:
-            suspicious.append((track_id, {"error": str(exc)}))
-            continue
-
-        rel_dx, rel_dy = checkpoint["relative_displacement_und"]
-        if abs(rel_dx) > max_abs_disp_px or abs(rel_dy) > max_abs_disp_px:
-            suspicious.append((track_id, checkpoint))
-    return suspicious
 
 
 def determine_intent(
         ped_track: Dict[str, Any],
         camera_displacements_undistorted: Dict[int, Dict[str, float]],
-        calibration_json_path: str,
-        motion_threshold: float = 0.15) -> Tuple[List[str], Dict[str, Any]]:
+        calibration_json_path: str) -> Tuple[List[str], Dict[str, Any]]:
     """
     只用首尾点做意图判定。
     """
@@ -1219,16 +1125,79 @@ def determine_intent(
         camera_displacements=camera_displacements_undistorted,
         calibration_json_path=calibration_json_path,
     )
-    rel_dx, rel_dy = rs["relative_displacement_und"]
+    r_dx, r_dy = rs["r"]
+    p_dx, p_dy = rs["p_raw"]
+    fn = rs["frame_nums"]
 
-    lateral = "stationary"
-    if abs(rel_dx) > motion_threshold:
-        lateral = "goes to the right" if rel_dx > 0 else "goes to the left"
+    # 先剔除异常值
+    if r_dx / fn > 15 or r_dy / fn > 15:
+        return ["nan", "nan"], rs
 
-    vertical = "stationary"
-    if abs(rel_dy) > motion_threshold:
-        vertical = "moves away from ego vehicle" if rel_dy < 0 else "moves towards ego vehicle"
+    lateral = 's'  # 默认stationary
+    p_x_fn = p_dx / fn
+    r_x_fn = r_dx / fn
+    c_x_fn = p_x_fn - r_x_fn
+    if r_dx < 0:  # 相对位移为负时，通常为左，但有些例外
+        if p_dx < 0:
+            lateral = 'l'  # left
+        elif abs(r_x_fn) >= 2:
+            lateral = 's'
+        elif 2 >= p_x_fn >= 0.5:  # 帧像素若太大，则非行人移动引起，而是因为车辆，实际有可能是反方向
+            lateral = 'l'
+        else:
+            lateral = 's'
+    elif r_dx > 0:  # 相对位移为正时，通常为右，但有些例外
+        if abs(p_dx) / fn >= 6:  # 过大是由车辆引起
+            if r_x_fn >= 5:
+                lateral = 'r'  # right
+            else:
+                lateral = 's'
+        elif abs(p_x_fn) >= 3.7:
+            lateral = 'r'
+        elif abs(c_x_fn) >= 2:  # 过度补偿
+            lateral = 's'
+        else:
+            lateral = 'l'
 
+    vertical = 's'
+    p_y_fn = p_dy / fn
+    r_y_fn = r_dy / fn
+    c_y_fn = p_y_fn - r_y_fn
+    if r_dy > 0:  # 相对位移为正，大部分情况为向前，即远离车，部分例外
+        if p_y_fn > 1:
+            vertical = 'f'  # forward
+        elif r_y_fn > 0.16:
+            vertical = 'b'
+        else:  # 过度补偿
+            vertical = 's'
+    elif r_dy < 0:  # 相对位移为负，通常为向后，即靠近车的方向，不分例外
+        if abs(r_y_fn) > 0.6:
+            if p_dy < 0:
+                if p_y_fn / c_y_fn > -0.1:
+                    vertical = 's'
+                else:
+                    vertical = 'b'
+            elif p_y_fn / c_y_fn < 0.16:
+                vertical = 's'
+            else:
+                vertical = 'b'
+        elif abs(r_y_fn) < 0.6:
+            if p_dy > 0:
+                if p_y_fn / c_y_fn < 0.3:
+                    vertical = 'b'
+                else:
+                    vertical = 's'
+            elif p_dy < 0:
+                if p_y_fn > -0.1:
+                    vertical = 's'
+                elif abs(r_y_fn) > 0.4:
+                    vertical = 'b'
+                else:
+                    vertical = 'f'
+
+    # 显然为横向过街的
+    if p_dx / 1920 > 0.85:
+        vertical = 's'
     return [lateral, vertical], rs
 
 
@@ -1384,15 +1353,14 @@ def process_dataset(video_root: str, anno_root: str, vehicle_root: str, camera_p
 
     # Process each sample
     output_data = {}
-    flag = 1
     count = 0
-    # 这里是处理前50个样本，并且加进度条 (tqdm)
-    # TODO: 总数是53，测试时可以先只用1个
+    # 这里是处理样本，并且加进度条 (tqdm)
+    # 总数是53，测试时可以先只用1个
     for sample_id, sample_data in tqdm(islice(dataset_path.items(), len(dataset_path)), desc="Processing samples",
                                        total=len(dataset_path)):
 
         # 循环每一个视频及其对应标注
-        # TODO: 标注文件是XML ETree格式的，需要解析成字典格式
+        # 标注文件是XML ETree格式的，这里解析成字典格式
         video_path = sample_data['video_path']
         anno_path = sample_data['anno_path']
 
@@ -1403,47 +1371,85 @@ def process_dataset(video_root: str, anno_root: str, vehicle_root: str, camera_p
         # animate_optical_flow(video_path)
 
         # Track objects in video and get their histories，这里应该是相当于获取行人的轨迹，行人轨迹已经合并了，并且生成的是新的id
-        track_histories, camera = process_video(video_path)
+        # track_histories, camera = process_video(video_path)
 
         # 如果出错了，就使用这个函数加载
-        # track_histories = load_json(r"filtered_tracks.json")
+        track_histories = load_json(r"filtered_tracks.json")
 
         # Plot 3D tracks for this sample，这是在 for 循环里的啊
         # plot_3d_tracks(track_histories, f"Object Tracks - Sample {sample_id}")
 
         # Match objects using Hungarian algorithm
         matches = match_objects(track_histories, output_data)
+        if len(matches) < len(output_data):
+            unmatch = {}
 
-        # 获取相机帧间位移
+        # 获取相机帧间物理位移（北东方向）
         vehicle = parse_vehicle(sample_data['vehicle_path'])
-        camera = build_camera_displacements(vehicle, camera_param_path)
+        camera = build_camera_displacements_corrected(vehicle, camera_param_path)
         save_results_to_json(camera, r"camera_displacements.json")
         print(f"相机位移已计算完成")
 
         # Process direction intention
         motion = {}
+
+        match_i = {v: k for k, v in matches.items()}
+        # 先对 GT 分配意图
+        for idx, track_data in output_data.items():
+            flag = 0  # 标志该轨迹是否被匹配
+            # 成功匹配的结果就可以放在track_histories里面，用它在track_histories里面的id
+            if match_i.get(idx) is not None:
+                track_id = match_i[idx]
+            else:
+                track_id = idx
+                flag = 1
+
+            # 此为数据传入时就已经发现该轨迹可能是静止不动的
+            if output_data.get(idx, {}).get('dir_intent') is not None:
+                if flag == 1:
+                    unmatch[track_id] = output_data[idx]['dir_intent']
+                else:
+                    track_histories[track_id]['dir_intent'] = output_data[idx]['dir_intent']
+                motion[track_id] = {}
+            else:
+                if flag == 1:
+                    unmatch[track_id], check_point = determine_intent(track_data, camera,
+                                                                      camera_param_path)
+                    print(f"{idx}未匹配，意图为{unmatch[track_id]}")
+                else:
+                    track_histories[track_id]['dir_intent'], check_point = determine_intent(track_data, camera,
+                                                                                            camera_param_path)
+                    print(f"{idx}已匹配，意图为{track_histories[track_id]['dir_intent']}")
+                motion[track_id] = check_point
+
+        # 接着对未匹配的轨迹分配意图
         for track_id, track_data in track_histories.items():
+            # 对应前面已经匹配的
+            if motion.get(track_id) is not None:
+                continue
+
             # 这里输出的是 [lateral intent, vertical intent]
             track_histories[track_id]['dir_intent'], check_point = determine_intent(track_data, camera,
-                                                                                    camera_param_path,
-                                                                                    motion_threshold=0.15)
+                                                                                    camera_param_path, )
+            print(f"{track_id}未匹配，意图为{track_histories[track_id]['dir_intent']}")
             motion[track_id] = check_point
 
-        # TODO: 匹配结束之后，GT可能有些没匹配上，这时候就需要对他们进行意图分析
+        save_checkpoints_to_excel(motion, "intent_tests.xlsx")
 
-        save_results_to_json(motion, r"motion_check.json")
-
-        save_xml_annotation(anno_path, output_dir, track_histories, matches)
+        save_xml_annotation(anno_path, output_dir, track_histories, matches, unmatch)
         count += 1
 
 
 def main():
-    """
     video_path = r"PIE/video"
     anno_path = r"PIE/annotation"
     output_dir = r"PIE/new_annotation"
-    process_dataset(video_path, anno_path, output_dir)
-    """
+    camera_param_path = r"PIE/camera_params/calibration_data.json"
+    vehicle = r"PIE/annotation_vehicle"
+    process_dataset(video_root=video_path, anno_root=anno_path, vehicle_root=vehicle, output_dir=output_dir,
+                    camera_param_path=camera_param_path)
+
+    """"""
     # test_match(r"filtered_tracks.json", r"PIE/annotation/set02/video_0003_annt.xml")
 
 
@@ -1475,25 +1481,27 @@ def test_camera_motion(json_path):
 
 def test_intent_from_track(json_path, vehicle_path, calibration_json_path):
     all_tracks = load_json(json_path)
-    track_items = list(all_tracks.items())[:20]
+    # track_items = list(all_tracks.items())[:20]  # 依据这前 20 个样本确定分类准则
+    track_items = parse_pedestrians(r"PIE/annotation/set02/video_0003_annt.xml")
 
     vehicle = parse_vehicle(vehicle_path)
     camera = build_camera_displacements_corrected(vehicle, calibration_json_path)
 
     checkpoints = {}
 
-    for track_id, obj in track_items:
-        intent, checkpoint = determine_intent(obj, camera, calibration_json_path, motion_threshold=0.15)
+    for track_id, obj in track_items.items():
+        intent, checkpoint = determine_intent(obj, camera, calibration_json_path)
         print(f"track_id={track_id}")
-        print(checkpoint)
+        print(intent)
+        # print(checkpoint)
         checkpoints[str(track_id)] = checkpoint
 
-    save_checkpoints_to_excel(checkpoints, "intent_checkpoints.xlsx")
+    save_checkpoints_to_excel(checkpoints, "intent_tests.xlsx")
 
 
 if __name__ == "__main__":
-    # main()
+    main()
     # test_camera_motion(r"filtered_tracks.json")
-    test_intent_from_track(r"filtered_tracks.json",
+    '''test_intent_from_track(r"filtered_tracks.json",
                            r"PIE/annotation_vehicle/set02/video_0003_obd.xml",
-                           r"PIE/camera_params/calibration_data.json")
+                           r"PIE/camera_params/calibration_data.json")'''
