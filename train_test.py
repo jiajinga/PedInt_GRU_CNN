@@ -34,7 +34,8 @@ for gpu in gpus:
 
 # path to JAAD and PIE dataset, please change to your local path
 path_jaad = "JAAD"
-path_pie = "/media/steven/MEDIA/PIE"
+# TODO: PIE 路径下的文件应该如何放？
+path_pie = "PIE"
 
 # config = tf.compat.v1.ConfigProto()
 # # config.gpu_options.per_process_gpu_memory_fraction=0.8
@@ -102,6 +103,7 @@ def run(config_file=None):
         if k in model_configs:
             configs[k].update(model_configs[k])
 
+    # TODO: time_to_event 在数据集里面具体有什么作用？
     # Calculate min track size
     tte = configs['model_opts']['time_to_event'] if isinstance(configs['model_opts']['time_to_event'], int) else \
         configs['model_opts']['time_to_event'][1]
@@ -155,6 +157,7 @@ def run(config_file=None):
             # if use local path:
             imdb = JAAD(data_path=path_jaad)
 
+        # TODO: 目前应该只用管这个数据接口
         # get sequences
         beh_seq_train = imdb.generate_data_trajectory_sequence('train', **configs['data_opts'])
         # beh_seq_val = None   # 不分配验证集吗？
@@ -199,6 +202,7 @@ def usage():
     print()
 
 if __name__ == '__main__':
+    # 这里就是接收输入，检查需要的文件是否给到
     try:
         opts, args = getopt.getopt(sys.argv[1:], 'hc:', ['help', 'config_file'])
     except getopt.GetoptError as err:
@@ -223,4 +227,5 @@ if __name__ == '__main__':
         usage()
         sys.exit(2)
 
+    # 这里就是正式开始运行了
     run(config_file=config_file)

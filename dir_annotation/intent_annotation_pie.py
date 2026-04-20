@@ -33,49 +33,33 @@ import pandas as pd
 
 
 # Check for GPU availability
-#device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#print(f"Using device: {device}")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')#
+print(f"Using device: {device}")#
 
 # Initialize models
-#yolo_model = YOLO('yolov8s.pt')
+yolo_model = YOLO('yolov8s.pt')#
 
 
 # ---------------------- 输入输出模块 --------------------------
-def build_dataset(video_root, anno_root, vehicle_root):
-    """数据集加载方式，适配 PIE，获取了系列 ID 视频路径 标注路径 车辆标注路径"""
+def build_dataset(video_root, anno_root):
+    """数据集加载方式，适配 PIE，获取视频、行人标注、行人特征标注、车辆标注路径。"""
     samples = {}
-    sample_id = []
+    sample_id = None
 
-    for set_name in sorted(os.listdir(video_root)):
-        set_id = set_name[-1] + "_"
-        set_path = os.path.join(video_root, set_name)
-
-        for video_name in sorted(os.listdir(set_path)):
-            video_path = os.path.join(set_path, video_name)
-            sample_id = set_id + video_name.split(".")[0][-2:]
-            samples[sample_id] = {"video_path": video_path}
-
-    for set_name in sorted(os.listdir(anno_root)):
-        set_id = set_name[-1] + "_"
-        set_path = os.path.join(anno_root, set_name)
-
-        for anno_name in sorted(os.listdir(set_path)):
-            if not anno_name.endswith(".xml"):
-                continue
-            sample_id = set_id + anno_name.split(".")[0][8:10]
-            anno_path = os.path.join(set_path, anno_name)
-            samples[sample_id]["anno_path"] = anno_path
-
-    for set_name in sorted(os.listdir(vehicle_root)):
-        set_id = set_name[-1] + "_"
-        set_path = os.path.join(vehicle_root, set_name)
-
-        for v_name in sorted(os.listdir(set_path)):
-            if not v_name.endswith(".xml"):
-                continue
-            sample_id = set_id + v_name.split(".")[0][8:10]
-            v_path = os.path.join(set_path, v_name)
-            samples[sample_id]["vehicle_path"] = v_path
+    set_id = [i[-1] for i in sorted(os.listdir(video_root))]
+    for s in set_id:
+        set_path = os.path.join(video_root, "set0" + s)
+        for i in sorted(os.listdir(set_path)):
+            v_id = i.split('.')[0][-2:]
+            sample_id = s+'_'+v_id
+            samples[sample_id] = {}
+            samples[sample_id]['video_path'] = os.path.join(set_path, i)
+            samples[sample_id]['anno_path'] = os.path.join(anno_root, 'annotations', "set0"+s,
+                                                           "video_00"+v_id+"_annt.xml")
+            samples[sample_id]['attri_path'] = os.path.join(anno_root, 'annotations_attributes', "set0" + s,
+                                                            "video_00" + v_id + "_attributes.xml")
+            samples[sample_id]['vehicle_path'] = os.path.join(anno_root, 'annotations_vehicle', "set0" + s,
+                                                              "video_00" + v_id + "_obd.xml")
 
     return samples
 
@@ -199,12 +183,12 @@ def load_camera_calibration(calibration_json_path: str) -> Dict[str, Any]:
     }
 
 
-def save_xml_annotation(anno_path, output_root, track_histories, matches, unmatch):
+def save_xml_annotation(anno_path, attri_path, output_root, track_histories, matches, unmatch):
     """向标注文件中添加新的行人及方向意图"""
 
     # 解析 XML 文件
-    tree = ET.parse(anno_path)
-    root = tree.getroot()
+    tree_atr = ET.parse(attri_path)
+    root_atr = tree_atr.getroot()
 
     # 先取出来已经匹配的意图
     match_intent = {v: track_histories[k]['dir_intent'] for k, v in matches.items()}
@@ -213,43 +197,31 @@ def save_xml_annotation(anno_path, output_root, track_histories, matches, unmatc
     ped_id = None
 
     # 对 GT 添加 dir_intent
-    for track in root.findall('track'):
-        if track.get('label') != 'pedestrian':
-            continue
+    for ped in root_atr.findall('pedestrian'):
+        ped_id = ped.get('id')
 
-        for box in track.findall('box'):
-            # 获取该 box 对应的行人 id
-            id_attr = box.find("attribute[@name='id']")
-            if id_attr is None:
-                continue
-            ped_id = id_attr.text
-
-            if ped_id in match_intent:
-                intent = match_intent[ped_id]
+        if ped_id in match_intent:
+            intent = match_intent[ped_id]
+        else:
+            if ped_id in unmatch:
+                intent = unmatch[ped_id]
             else:
-                if ped_id in unmatch:
-                    intent = unmatch[ped_id]
-                else:
-                    raise ValueError(f"{ped_id}缺失对应意图标签")
+                raise ValueError(f"{ped_id}缺失对应意图标签")
 
+        ped.set('dir_intent', ', '.join(intent))
 
-            # 检查是否已存在 dir_intent 属性，若存在则先移除（避免重复）
-            existing = box.find("attribute[@name='dir_intent']")
-            if existing is not None:
-                box.remove(existing)
-
-            # 添加新属性
-            attr = ET.SubElement(box, 'attribute')
-            attr.set('name', 'dir_intent')
-            attr.text = ', '.join(intent)
-
-        id_max = int(ped_id.split('_')[-1]) if int(ped_id.split('_')[-1]) > id_max else id_max
+        try:
+            id_max = max(id_max, int(str(ped_id).split('_')[-1]))
+        except Exception:
+            pass
 
     anno_path_normalized = os.path.normpath(anno_path)  # 为了避免分割出错
     set_num = anno_path_normalized.split(os.sep)[-2][-1]
     # TODO: 这个编号有问题，虽然的确是video的编号，但实际PIE用的是最后一位（对于单位数）
     v_num = anno_path_normalized.split(os.sep)[-1].split(".")[0][8:10]
 
+    tree_bx = ET.parse(anno_path)
+    root_bx = tree_bx.getroot()
     # 接着创建未匹配的轨迹的标注
     for track_id, track_data in track_histories.items():
         boxes = track_data.get('boxes')
@@ -264,7 +236,7 @@ def save_xml_annotation(anno_path, output_root, track_histories, matches, unmatc
         new_id = '_'.join([set_num, v_num, str(id_max)])
 
         # 创建 track 元素
-        track_elem = ET.SubElement(root, 'track')
+        track_elem = ET.SubElement(root_bx, 'track')
         track_elem.set('label', 'pedestrian')
 
         # 为每一帧添加 box
@@ -292,35 +264,9 @@ def save_xml_annotation(anno_path, output_root, track_histories, matches, unmatc
             id_attr.set('name', 'id')
             id_attr.text = new_id
 
-            # gesture (默认 __undefined__)
-            gesture_attr = ET.SubElement(box_elem, 'attribute')
-            gesture_attr.set('name', 'gesture')
-            gesture_attr.text = '__undefined__'
-
-            # action (默认 standing)
-            action_attr = ET.SubElement(box_elem, 'attribute')
-            action_attr.set('name', 'action')
-            action_attr.text = 'standing'
-
-            # cross (默认 not-crossing)
-            cross_attr = ET.SubElement(box_elem, 'attribute')
-            cross_attr.set('name', 'cross')
-            cross_attr.text = 'not-crossing'
-
-            # look (默认 not-looking)
-            look_attr = ET.SubElement(box_elem, 'attribute')
-            look_attr.set('name', 'look')
-            look_attr.text = 'not-looking'
-
-            # occlusion (默认 none)
-            occlusion_attr = ET.SubElement(box_elem, 'attribute')
-            occlusion_attr.set('name', 'occlusion')
-            occlusion_attr.text = 'none'
-
-            # dir_intent
-            dir_intent_attr = ET.SubElement(box_elem, 'attribute')
-            dir_intent_attr.set('name', 'dir_intent')
-            dir_intent_attr.text = ', '.join(dir_intent)
+        ped_elem = ET.SubElement(root_atr, 'pedestrian')
+        ped_elem.set('id', new_id)
+        ped_elem.set('dir_intent', ', '.join(dir_intent) if isinstance(dir_intent, (list, tuple)) else str(dir_intent))
 
     # 生成保存路径，创建输出目录
     output_path = os.path.join(output_root, anno_path_normalized.split(os.sep)[-2],
@@ -328,7 +274,18 @@ def save_xml_annotation(anno_path, output_root, track_histories, matches, unmatc
     os.makedirs(os.path.join(output_root, anno_path.split(os.sep)[-2]), exist_ok=True)
 
     # 保存修改后的 XML 文件
-    tree.write(output_path)
+    # 保存 ped_attributes（attri xml）
+    attri_path_normalized = os.path.normpath(attri_path)
+    output_attri_path = os.path.join(
+        output_root+"_attributes",
+        attri_path_normalized.split(os.sep)[-2],
+        attri_path_normalized.split(os.sep)[-1]
+    )
+    os.makedirs(os.path.dirname(output_attri_path), exist_ok=True)
+    tree_atr.write(output_attri_path)
+    print(f"new ped_attributes have been saved to {output_attri_path}")
+
+    tree_bx.write(output_path)
     print(f"new annotations have been saved to {output_path}")
 
 
@@ -663,7 +620,7 @@ def process_video(video_path: str,
     cap.release()
 
     # 保存结果
-    save_results_to_json(track_histories, r"yolo_tracks.json")
+    # save_results_to_json(track_histories, r"yolo_tracks.json")
     print(f"轨迹已全部收集完成，总计{len(track_histories)}")
 
     # Link broken tracks
@@ -671,7 +628,7 @@ def process_video(video_path: str,
     track_histories = link_broken_tracks(track_histories,
                                          max_frame_gap=15,
                                          max_spatial_dist=100.0)
-    save_results_to_json(track_histories, r"linked_tracks.json")
+    # save_results_to_json(track_histories, r"linked_tracks.json")
     print(f"轨迹已连接，现有轨迹数量{len(track_histories)}")
 
     # TODO: 对 track_histories 过滤
@@ -682,7 +639,7 @@ def process_video(video_path: str,
 
     for i in short_track_id:
         del track_histories[i]
-    save_results_to_json(track_histories, r"filtered_tracks.json")
+    # save_results_to_json(track_histories, r"filtered_tracks.json")
     print(f"过滤短时轨迹，数量为{len(short_track_id)}")
 
     # 处理完一个视频后重置跟踪器，避免 ID 混乱
@@ -1343,11 +1300,11 @@ def display_frame_with_grid(frame: np.ndarray):
 
 # ------------------------------------ 主函数 -------------------------------------
 # 这个函数应该是完整的数据处理流程
-def process_dataset(video_root: str, anno_root: str, vehicle_root: str, camera_param_path: str, output_dir: str):
+def process_dataset(video_root: str, anno_root: str, camera_param_path: str, output_dir: str):
     """Process entire dataset and save results"""
 
     # 加载路径
-    dataset_path = build_dataset(video_root, anno_root, vehicle_root)
+    dataset_path = build_dataset(video_root, anno_root)
     # Create output directory，如果存在就跳过，应该只用生成 xml 标注文件
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1363,6 +1320,7 @@ def process_dataset(video_root: str, anno_root: str, vehicle_root: str, camera_p
         # 标注文件是XML ETree格式的，这里解析成字典格式
         video_path = sample_data['video_path']
         anno_path = sample_data['anno_path']
+        attri_path = sample_data['attri_path']
 
         # 获取 PIE 数据集中已经标注好的行人 id, boxes, frame_nums，最终目的是服务于匹配
         output_data = parse_pedestrians(anno_path)
@@ -1387,7 +1345,7 @@ def process_dataset(video_root: str, anno_root: str, vehicle_root: str, camera_p
         # 获取相机帧间物理位移（北东方向）
         vehicle = parse_vehicle(sample_data['vehicle_path'])
         camera = build_camera_displacements_corrected(vehicle, camera_param_path)
-        save_results_to_json(camera, r"camera_displacements.json")
+        # save_results_to_json(camera, r"camera_displacements.json")
         print(f"相机位移已计算完成")
 
         # Process direction intention
@@ -1434,22 +1392,19 @@ def process_dataset(video_root: str, anno_root: str, vehicle_root: str, camera_p
             print(f"{track_id}未匹配，意图为{track_histories[track_id]['dir_intent']}")
             motion[track_id] = check_point
 
-        save_checkpoints_to_excel(motion, "intent_tests.xlsx")
+        # save_checkpoints_to_excel(motion, "intent_tests.xlsx")
 
-        save_xml_annotation(anno_path, output_dir, track_histories, matches, unmatch)
+        save_xml_annotation(anno_path, attri_path, output_dir, track_histories, matches, unmatch)
         count += 1
 
 
 def main():
-    video_path = r"PIE/video"
-    anno_path = r"PIE/annotation"
-    output_dir = r"PIE/new_annotation"
-    camera_param_path = r"PIE/camera_params/calibration_data.json"
-    vehicle = r"PIE/annotation_vehicle"
-    process_dataset(video_root=video_path, anno_root=anno_path, vehicle_root=vehicle, output_dir=output_dir,
+    video_path = r"PIE\video"
+    anno_path = r"PIE\annotations"
+    output_dir = r"PIE\annotations\new_annotations"
+    camera_param_path = r"PIE\camera_params\calibration_data.json"
+    process_dataset(video_root=video_path, anno_root=anno_path, output_dir=output_dir,
                     camera_param_path=camera_param_path)
-
-    """"""
     # test_match(r"filtered_tracks.json", r"PIE/annotation/set02/video_0003_annt.xml")
 
 
@@ -1505,3 +1460,9 @@ if __name__ == "__main__":
     '''test_intent_from_track(r"filtered_tracks.json",
                            r"PIE/annotation_vehicle/set02/video_0003_obd.xml",
                            r"PIE/camera_params/calibration_data.json")'''
+    # video_path = r"..\PIE\video"
+    # anno_path = r"..\PIE\annotations"
+    # sample = build_dataset(video_path, anno_path)
+    # print(sample)
+    # if not os.path.isfile(sample['2_03']['attri_path']):
+    #     raise FileNotFoundError(f"文件不存在或不是有效文件：{sample['2_03']['attri_path']}")

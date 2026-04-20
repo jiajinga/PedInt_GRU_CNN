@@ -624,7 +624,8 @@ class ActionPredict(object):
             feat_shape = sequences.shape[1:]
         return sequences, feat_shape
 
-    # 获取原始序列数据，具体包括中心点、边界框、行人id、是否过马路、图像路径、速度、time to event等信息，并且根据选项进行数据增强和预处理，最终返回处理后的数据序列以及正负样本的数量
+    # 获取原始序列数据，具体包括中心点、边界框、行人id、是否过马路、图像路径、速度、time to event等信息，并且根据选项进行数据增强和预处理，
+    # 最终返回处理后的数据序列以及正负样本的数量
     def get_data_sequence(self, data_type, data_raw, opts):
         """
         Generates raw sequences from a given dataset

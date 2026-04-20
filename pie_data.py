@@ -56,8 +56,9 @@ class PIE(object):
         assert isdir(self._pie_path), \
             'pie path does not exist: {}'.format(self._pie_path)
 
-        self._annotation_path = join(self._pie_path, 'annotations')
-        self._annotation_attributes_path = join(self._pie_path, 'annotations_attributes')
+        # TODO: annotations/annotations -> annotations/new_annotations
+        self._annotation_path = join(self._pie_path, 'new_annotations')
+        self._annotation_attributes_path = join(self._pie_path, 'new_annotations_attributes')
         self._annotation_vehicle_path = join(self._pie_path, 'annotations_vehicle')
 
         self._clips_path = join(self._pie_path, 'PIE_clips')
@@ -87,6 +88,7 @@ class PIE(object):
         :param image_set: Image set split
         :return: Set ids of the image set
         """
+        # TODO: 这个数据集划分需要进行修改
         image_set_nums = {'train': ['set01', 'set02', 'set04'],
                           'val': ['set05', 'set06'],
                           'test': ['set03'],
@@ -276,6 +278,9 @@ class PIE(object):
                                'hand_rightofway': 3, 'nod': 4, 'other': 5},
                    'cross': {'not-crossing': 0, 'crossing': 1, 'crossing-irrelevant': -1},
                    'crossing': {'not-crossing': 0, 'crossing': 1, 'irrelevant': -1},
+                   # TODO: 这里添加了 dir_intent
+                   'dir_intent': {'s, s': 0, 'r, s': 1, 'l, s': 2, 's, f': 3, 's, b': 4, 'r, f': 5, 'r, b': 6,
+                                  'l, f': 7, 'l, b': 8, 'nan, nan': -1},
                    'age': {'child': 0, 'young': 1, 'adult': 2, 'senior': 3},
                    'designated': {'ND': 0, 'D': 1},
                    'gender': {'n/a': 0, 'female': 1, 'male': 2},
@@ -306,6 +311,9 @@ class PIE(object):
                                     4: 'nod', 5: 'other'},
                    'cross': {0: 'not-crossing', 1: 'crossing', -1: 'crossing-irrelevant'},
                    'crossing': {0: 'not-crossing', 1: 'crossing', -1: 'irrelevant'},
+                   # TODO: 这里添加了 dir_intent
+                   'dir_intent': {0: 's, s', 1: 'r, s', 2: 'l, s', 3: 's, f', 4: 's, b', 5: 'r, f', 6: 'r, b',
+                                  7: 'l, f', 8: 'l, b'},
                    'age': {0: 'child', 1: 'young', 2: 'adult', 3: 'senior'},
                    'designated': {0: 'ND', 1: 'D'},
                    'gender': {0: 'n/a', 1: 'female', 2: 'male'},
@@ -406,6 +414,7 @@ class PIE(object):
         for p in pedestrians:
             ped_id = p.get('id')
             attributes[ped_id] = {}
+            # TODO: 看来这里的意思是针对已有的标注信息来进行赋值，如果没有也不影响，不一定非得是全部有，但是不知道模型是否需要这些参数
             for k, v in p.items():
                 if 'id' in k:
                     continue
@@ -440,6 +449,7 @@ class PIE(object):
 
     def generate_database(self):
         """
+        把所有的标注文件进行整合
         Generates and saves a database of the pie dataset by integrating all annotations
         Dictionary structure:
         'set_id'(str): {
@@ -460,6 +470,7 @@ class PIE(object):
                         'frames': list(int)
                         'occlusion': list(int)
                         'bbox': list([x1, y1, x2, y2]) (float)
+                        # TODO: 在这里单独加一个 dir_intent 吧，也需要加 -映射函数-
                         'behavior'(str): {
                             'action': list(int)
                             'gesture': list(int)
@@ -479,6 +490,7 @@ class PIE(object):
                              'signalized': int
                              'traffic_direction': int
                              'group_size': int
+                             # TODO: 严查这个motion_direction，我咋没在标注里面看到它，真没有
                              'motion_direction': int
                 'vehicle_annotations'(str){
                     'frame_id'(int){'longitude': float
@@ -503,6 +515,7 @@ class PIE(object):
         print('---------------------------------------------------------')
         print("Generating database for pie")
 
+        # 先检查数据缓存文件，若有，则直接加载
         cache_file = join(self.cache_path, 'pie_database.pkl')
         if isfile(cache_file) and not self._regen_database:
             with open(cache_file, 'rb') as fid:
@@ -513,6 +526,7 @@ class PIE(object):
             print('pie annotations loaded from {}'.format(cache_file))
             return database
 
+        # 否则，创建数据缓存文件
         # Path to the folder annotations
         set_ids = [f for f in sorted(listdir(self._annotation_path))]
 
@@ -871,7 +885,7 @@ class PIE(object):
     def generate_data_trajectory_sequence(self, image_set, **opts):
         """
         Generates pedestrian tracks
-        :param image_set: the split set to produce for. Options are train, test, val.
+        :param image_set: the split set to produce for. Options are train, test, val.数据集类型
         :param opts:
                 'fstride': Frequency of sampling from the data.
                 'height_rng': The height range of pedestrians to use.
@@ -898,6 +912,7 @@ class PIE(object):
                                     'regen_data': False},
                   'kfold_params': {'num_folds': 5, 'fold': 1}}
 
+        # 传参，把前面的默认值进行修改
         for i in opts.keys():
             params[i] = opts[i]
 
@@ -1041,6 +1056,7 @@ class PIE(object):
                     images = [self._get_image_path(sid, vid, f) for f in frame_ids]
                     occlusions = pid_annots[pid]['occlusion'][:end_idx + 1]
 
+                    # TODO: occulusion
                     if height_rng[0] > 0 or height_rng[1] < float('inf'):
                         images, boxes, frame_ids, occlusions = self._height_check(height_rng,
                                                                                   frame_ids, boxes,
@@ -1082,14 +1098,17 @@ class PIE(object):
                 'pid': pids_seq,
                 'bbox': box_seq,
                 'center': center_seq,
-                'occlusion': occ_seq,
+                # 'occlusion': occ_seq,  # 这个我只能提供 none
                 'obd_speed': obds_seq,
                 'gps_speed': gpss_seq,
                 'heading_angle': head_ang_seq,
                 'gps_coord': gpsc_seq,
                 'yrp': yrp_seq,
-                'intention_prob': intent_seq,
-                'activities': activities,
+                # 'intention_prob': intent_seq,
+                # TODO: 更换为 dir_intent ?
+                'dir_intent': d_intent,
+                # 'activities': activities,  # 这个对应的是是否发生了 crossing 的动作，有一个横向过街的判断的，这些人对应的动作就是过街，
+                # 其他人放成 irrelevant， 或者是考虑直接删掉这个参数，不知道有什么影响
                 'image_dimension': self._get_dim()}
 
     def _get_intention(self, image_set, annotations, **params):
