@@ -57,9 +57,9 @@ class PIE(object):
             'pie path does not exist: {}'.format(self._pie_path)
 
         # TODO: annotations/annotations -> annotations/new_annotations
-        self._annotation_path = join(self._pie_path, 'new_annotations')
-        self._annotation_attributes_path = join(self._pie_path, 'new_annotations_attributes')
-        self._annotation_vehicle_path = join(self._pie_path, 'annotations_vehicle')
+        self._annotation_path = join(self._pie_path, 'annotations/new_annotations')
+        self._annotation_attributes_path = join(self._pie_path, 'annotations/new_annotations_attributes')
+        self._annotation_vehicle_path = join(self._pie_path, 'annotations/annotations_vehicle')
 
         self._clips_path = join(self._pie_path, 'PIE_clips')
         self._images_path = join(self._pie_path, 'images')
@@ -89,11 +89,14 @@ class PIE(object):
         :return: Set ids of the image set
         """
         # TODO: 这个数据集划分需要进行修改
-        image_set_nums = {'train': ['set01', 'set02', 'set04'],
+        """image_set_nums = {'train': ['set01', 'set02', 'set04'],
                           'val': ['set05', 'set06'],
                           'test': ['set03'],
                           'all': ['set01', 'set02', 'set03',
-                                  'set04', 'set05', 'set06']}
+                                  'set04', 'set05', 'set06']}"""
+        image_set_nums = {'train': ['set01'],
+                          'test': ['set02'],
+                          'all': ['set01', 'set02']}
         return image_set_nums[image_set]
 
     def _get_image_path(self, sid, vid, fid):
@@ -313,7 +316,7 @@ class PIE(object):
                    'crossing': {0: 'not-crossing', 1: 'crossing', -1: 'irrelevant'},
                    # TODO: 这里添加了 dir_intent
                    'dir_intent': {0: 's, s', 1: 'r, s', 2: 'l, s', 3: 's, f', 4: 's, b', 5: 'r, f', 6: 'r, b',
-                                  7: 'l, f', 8: 'l, b'},
+                                  7: 'l, f', 8: 'l, b', -1: 'nan, nan'},
                    'age': {0: 'child', 1: 'young', 2: 'adult', 3: 'senior'},
                    'designated': {0: 'ND', 1: 'D'},
                    'gender': {0: 'n/a', 1: 'female', 2: 'male'},
@@ -395,8 +398,8 @@ class PIE(object):
                     annotations[traffic_annt][obj_id]['frames'].append(int(b.get('frame')))
                     if obj_label == 'traffic_light':
                         annotations[traffic_annt][obj_id]['state'].append(self._map_text_to_scalar('state',
-                                                                                                    b.find(
-                                                                                                        './attribute[@name=\"state\"]').text))
+                                                                                                   b.find(
+                                                                                                       './attribute[@name=\"state\"]').text))
         return annotations
 
     def _get_ped_attributes(self, setid, vid):
@@ -471,6 +474,7 @@ class PIE(object):
                         'occlusion': list(int)
                         'bbox': list([x1, y1, x2, y2]) (float)
                         # TODO: 在这里单独加一个 dir_intent 吧，也需要加 -映射函数-
+                        'dir_intent': int
                         'behavior'(str): {
                             'action': list(int)
                             'gesture': list(int)
@@ -490,7 +494,7 @@ class PIE(object):
                              'signalized': int
                              'traffic_direction': int
                              'group_size': int
-                             # TODO: 严查这个motion_direction，我咋没在标注里面看到它，真没有
+                             # 严查这个motion_direction，我咋没在标注里面看到它，真没有
                              'motion_direction': int
                 'vehicle_annotations'(str){
                     'frame_id'(int){'longitude': float
@@ -598,7 +602,7 @@ class PIE(object):
                         if ped_annots['attributes']['intention_prob'] > 0.5:
                             crossing['not-crossing'] += 1
                         else:
-                            crossing['irrelevant'] += 1                    
+                            crossing['irrelevant'] += 1
                     intersection[
                         self._map_scalar_to_text('intersection', ped_annots['attributes']['intersection'])] += 1
                     traffic_direction[self._map_scalar_to_text('traffic_direction',
@@ -853,7 +857,7 @@ class PIE(object):
             bbox[2] = img_width
         return bbox
 
-    def _height_check(self, height_rng, frame_ids, boxes, images, occlusion):
+    def _height_check(self, height_rng, frame_ids, boxes, images):  # , occlusion):
         """
         Checks whether the bounding boxes are within a given height limit. If not, it
         will adjust the length of bounding boxes in data sequences accordingly
@@ -861,18 +865,19 @@ class PIE(object):
         :param frame_ids: List of frame ids
         :param boxes: List of bounding boxes
         :param images: List of images
-        :param occlusion: List of occlusions
+        :param occlusion: List of occlusions  无用，删除
         :return: The adjusted data sequences
         """
-        imgs, box, frames, occ = [], [], [], []
+        # imgs, box, frames, occ = [], [], [], []
+        imgs, box, frames = [], [], []
         for i, b in enumerate(boxes):
             bbox_height = abs(b[1] - b[3])
             if height_rng[0] <= bbox_height <= height_rng[1]:
                 box.append(b)
                 imgs.append(images[i])
                 frames.append(frame_ids[i])
-                occ.append(occlusion[i])
-        return imgs, box, frames, occ
+                # occ.append(occlusion[i])
+        return imgs, box, frames  # , occ
 
     def _get_center(self, box):
         """
@@ -946,7 +951,7 @@ class PIE(object):
         height_rng = params['height_rng']
 
         image_seq, pids_seq = [], []
-        box_seq, center_seq, occ_seq = [], [], []
+        box_seq, center_seq = [], []
         intent_seq = []
         obds_seq, gpss_seq, head_ang_seq, gpsc_seq, yrp_seq = [], [], [], [], []
 
@@ -964,12 +969,12 @@ class PIE(object):
                     frame_ids = pid_annots[pid]['frames']
                     boxes = pid_annots[pid]['bbox']
                     images = [self._get_image_path(sid, vid, f) for f in frame_ids]
-                    occlusions = pid_annots[pid]['occlusion']
+                    # occlusions = pid_annots[pid]['occlusion']
 
                     if height_rng[0] > 0 or height_rng[1] < float('inf'):
-                        images, boxes, frame_ids, occlusions = self._height_check(height_rng,
-                                                                                  frame_ids, boxes,
-                                                                                  images, occlusions)
+                        images, boxes, frame_ids = self._height_check(height_rng,
+                                                                      frame_ids, boxes,
+                                                                      images)  # , occlusions)
 
                     if len(boxes) / seq_stride < params['min_track_size']:  # max_obs_size: #90 + 45
                         continue
@@ -980,7 +985,7 @@ class PIE(object):
                     image_seq.append(images[::seq_stride])
                     box_seq.append(boxes[::seq_stride])
                     center_seq.append([self._get_center(b) for b in boxes][::seq_stride])
-                    occ_seq.append(occlusions[::seq_stride])
+                    # occ_seq.append(occlusions[::seq_stride])
 
                     ped_ids = [[pid]] * len(boxes)
                     pids_seq.append(ped_ids[::seq_stride])
@@ -1004,7 +1009,7 @@ class PIE(object):
                 'pid': pids_seq,
                 'bbox': box_seq,
                 'center': center_seq,
-                'occlusion': occ_seq,
+                # 'occlusion': occ_seq,
                 'obd_speed': obds_seq,
                 'gps_speed': gpss_seq,
                 'heading_angle': head_ang_seq,
@@ -1030,10 +1035,11 @@ class PIE(object):
         height_rng = params['height_rng']
 
         image_seq, pids_seq = [], []
-        box_seq, center_seq, occ_seq = [], [], []
+        # box_seq, center_seq, occ_seq = [], [], []
+        box_seq, center_seq = [], []
         intent_seq = []
         obds_seq, gpss_seq, head_ang_seq, gpsc_seq, yrp_seq = [], [], [], [], []
-        activities = []
+        # activities = []
 
         set_ids, _pids = self._get_data_ids(image_set, params)
 
@@ -1047,20 +1053,23 @@ class PIE(object):
                         continue
                     num_pedestrians += 1
 
-                    frame_ids = pid_annots[pid]['frames']
-                    event_frame = pid_annots[pid]['attributes']['crossing_point']
+                    frame_ids = pid_annots[pid]['frames']   # 所有帧
+                    # 如果不过街，就取结尾的倒数第三帧；如果过街，就截断到开始过街的那一帧
+                    # TODO: 我认为应该保留所有帧
+                    # event_frame = pid_annots[pid]['attributes']['crossing_point']
 
-                    end_idx = frame_ids.index(event_frame)
-                    boxes = pid_annots[pid]['bbox'][:end_idx + 1]
-                    frame_ids = frame_ids[: end_idx + 1]
+                    # end_idx = frame_ids.index(event_frame)
+                    # boxes = pid_annots[pid]['bbox'][:end_idx + 1]
+                    boxes = pid_annots[pid]['bbox']
+                    # frame_ids = frame_ids[: end_idx + 1]
                     images = [self._get_image_path(sid, vid, f) for f in frame_ids]
-                    occlusions = pid_annots[pid]['occlusion'][:end_idx + 1]
+                    # occlusions = pid_annots[pid]['occlusion'][:end_idx + 1]
 
                     # TODO: occulusion
                     if height_rng[0] > 0 or height_rng[1] < float('inf'):
-                        images, boxes, frame_ids, occlusions = self._height_check(height_rng,
-                                                                                  frame_ids, boxes,
-                                                                                  images, occlusions)
+                        images, boxes, frame_ids = self._height_check(height_rng,
+                                                                      frame_ids, boxes,
+                                                                      images)  # , occlusions)
 
                     if len(boxes) / seq_stride < params['min_track_size']:
                         continue
@@ -1071,16 +1080,17 @@ class PIE(object):
                     image_seq.append(images[::seq_stride])
                     box_seq.append(boxes[::seq_stride])
                     center_seq.append([self._get_center(b) for b in boxes][::seq_stride])
-                    occ_seq.append(occlusions[::seq_stride])
+                    # occ_seq.append(occlusions[::seq_stride])
 
                     ped_ids = [[pid]] * len(boxes)
                     pids_seq.append(ped_ids[::seq_stride])
 
-                    intent = [[pid_annots[pid]['attributes']['intention_prob']]] * len(boxes)
+                    # intent = [[pid_annots[pid]['attributes']['intention_prob']]] * len(boxes)
+                    intent = [[pid_annots[pid]['attributes']['dir_intent']]] * len(boxes)
                     intent_seq.append(intent[::seq_stride])
 
-                    acts = [[int(pid_annots[pid]['attributes']['crossing'] > 0)]] * len(boxes)
-                    activities.append(acts[::seq_stride])
+                    # acts = [[int(pid_annots[pid]['attributes']['crossing'] > 0)]] * len(boxes)
+                    # activities.append(acts[::seq_stride])
 
                     gpsc_seq.append([[(vid_annots[i]['latitude'], vid_annots[i]['longitude'])]
                                      for i in frame_ids][::seq_stride])
@@ -1106,7 +1116,7 @@ class PIE(object):
                 'yrp': yrp_seq,
                 # 'intention_prob': intent_seq,
                 # TODO: 更换为 dir_intent ?
-                'dir_intent': d_intent,
+                'dir_intent': intent_seq,
                 # 'activities': activities,  # 这个对应的是是否发生了 crossing 的动作，有一个横向过街的判断的，这些人对应的动作就是过街，
                 # 其他人放成 irrelevant， 或者是考虑直接删掉这个参数，不知道有什么影响
                 'image_dimension': self._get_dim()}
@@ -1129,7 +1139,7 @@ class PIE(object):
 
         intention_prob, intention_binary = [], []
         image_seq, pids_seq = [], []
-        box_seq, center_seq, occ_seq = [], [], []
+        box_seq, center_seq = [], []
         set_ids, _pids = self._get_data_ids(image_set, params)
 
         for sid in set_ids:
@@ -1150,12 +1160,12 @@ class PIE(object):
                     boxes = pid_annots[pid]['bbox'][start_idx:end_idx + 1]
                     frame_ids = frames[start_idx:end_idx + 1]
                     images = [self._get_image_path(sid, vid, f) for f in frame_ids]
-                    occlusions = pid_annots[pid]['occlusion'][start_idx:end_idx + 1]
+                    # occlusions = pid_annots[pid]['occlusion'][start_idx:end_idx + 1]
 
                     if height_rng[0] > 0 or height_rng[1] < float('inf'):
-                        images, boxes, frame_ids, occlusions = self._height_check(height_rng,
-                                                                                  frame_ids, boxes,
-                                                                                  images, occlusions)
+                        images, boxes, frame_ids = self._height_check(height_rng,
+                                                                      frame_ids, boxes,
+                                                                      images)  # , occlusions)
                     if len(boxes) / seq_stride < params['min_track_size']:
                         continue
 
@@ -1167,7 +1177,7 @@ class PIE(object):
 
                     image_seq.append(images[::seq_stride])
                     box_seq.append(boxes[::seq_stride])
-                    occ_seq.append(occlusions[::seq_stride])
+                    # occ_seq.append(occlusions[::seq_stride])
 
                     intention_prob.append(int_prob[::seq_stride])
                     intention_binary.append(int_bin[::seq_stride])
@@ -1181,7 +1191,7 @@ class PIE(object):
 
         return {'image': image_seq,
                 'bbox': box_seq,
-                'occlusion': occ_seq,
+                # 'occlusion': occ_seq,
                 'intention_prob': intention_prob,
                 'intention_binary': intention_binary,
                 'ped_id': pids_seq}
