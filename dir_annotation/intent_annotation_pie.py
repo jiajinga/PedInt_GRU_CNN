@@ -1352,6 +1352,7 @@ def process_dataset(video_root: str, anno_root: str, camera_param_path: str, out
         motion = {}
 
         match_i = {v: k for k, v in matches.items()}
+        abnormal_to_delete = []    # 记录异常值
         # 先对 GT 分配意图
         for idx, track_data in output_data.items():
             flag = 0  # 标志该轨迹是否被匹配
@@ -1373,12 +1374,20 @@ def process_dataset(video_root: str, anno_root: str, camera_param_path: str, out
                 if flag == 1:
                     unmatch[track_id], check_point = determine_intent(track_data, camera,
                                                                       camera_param_path)
+                    if unmatch[track_id] == ["nan", "nan"]:
+                        abnormal_to_delete.append(idx)
                     print(f"{idx}未匹配，意图为{unmatch[track_id]}")
                 else:
                     track_histories[track_id]['dir_intent'], check_point = determine_intent(track_data, camera,
                                                                                             camera_param_path)
+                    if track_histories[track_id]['dir_intent'] == ["nan", "nan"]:
+                        abnormal_to_delete.append(idx)
                     print(f"{idx}已匹配，意图为{track_histories[track_id]['dir_intent']}")
                 motion[track_id] = check_point
+
+        for i in abnormal_to_delete:
+            output_data.pop(i)   # 删除异常值
+        abnormal_to_delete = []
 
         # 接着对未匹配的轨迹分配意图
         for track_id, track_data in track_histories.items():
@@ -1389,8 +1398,14 @@ def process_dataset(video_root: str, anno_root: str, camera_param_path: str, out
             # 这里输出的是 [lateral intent, vertical intent]
             track_histories[track_id]['dir_intent'], check_point = determine_intent(track_data, camera,
                                                                                     camera_param_path, )
+            if track_histories[track_id]['dir_intent'] == ["nan", "nan"]:
+                abnormal_to_delete.append(track_id)
             print(f"{track_id}未匹配，意图为{track_histories[track_id]['dir_intent']}")
             motion[track_id] = check_point
+
+        for i in abnormal_to_delete:
+            track_histories.pop(i)
+            print(f"{i}已被删除")
 
         # save_checkpoints_to_excel(motion, "intent_tests.xlsx")
 
