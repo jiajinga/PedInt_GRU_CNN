@@ -22,6 +22,7 @@ from tensorflow.keras import backend as K
 from tensorflow.keras.utils import Sequence
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.metrics import roc_auc_score, roc_curve, precision_recall_curve
+from sklearn.metrics import confusion_matrix, cohen_kappa_score, log_loss
 from sklearn.svm import LinearSVC
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -281,22 +282,27 @@ class ActionPredict(object):
             Tuple containing the size of features
         """
         base_model = VGG19(weights='imagenet')  # 基础模型
-        # 将VGG的输出改为 block4_pool 的输出，作为特征提取的结果，这个模型是专门用来处理 local_context_cnn 和 mask_cnn 的
+        # 将VGG的输出改为 block4_pool 的输出，作为特征提取的结果，
+        # 这个模型用于 local_context_cnn / scene_context_cnn / mask_cnn 分支。
         VGGmodel = Model(inputs=base_model.input, outputs=base_model.get_layer('block4_pool').output)
         # load the feature files if exists   你也没 load 啊
         print("Generating {} features crop_type={} crop_mode={}\
               \nsave_path={}, ".format(data_type, crop_type, crop_mode,
                                        save_path))
-        # load segmentation model
-        segmodel_path = "deeplabv3_mnv2_cityscapes_train_2018_02_05.tar.gz"
-        segmodel = DeepLabModel(segmodel_path)
-        LABEL_NAMES = np.asarray([
-            'road', 'sidewalk', 'building', 'wall', 'fence', 'pole', 'traffic light',
-            'traffic sign', 'vegetation', 'terrain', 'sky', 'person', 'rider', 'car', 'truck',
-            'bus', 'train', 'motorcycle', 'bycycle'])
-
-        FULL_LABEL_MAP = np.arange(len(LABEL_NAMES)).reshape(len(LABEL_NAMES), 1)
-        FULL_COLOR_MAP = label_to_color_image(FULL_LABEL_MAP)
+        # load segmentation model and color maps only for mask-based branches
+        segmodel = None
+        LABEL_NAMES = None
+        FULL_LABEL_MAP = None
+        FULL_COLOR_MAP = None
+        if crop_type in ['mask_cnn', 'mask']:
+            segmodel_path = "deeplabv3_mnv2_cityscapes_train_2018_02_05.tar.gz"
+            segmodel = DeepLabModel(segmodel_path)
+            LABEL_NAMES = np.asarray([
+                'road', 'sidewalk', 'building', 'wall', 'fence', 'pole', 'traffic light',
+                'traffic sign', 'vegetation', 'terrain', 'sky', 'person', 'rider', 'car', 'truck',
+                'bus', 'train', 'motorcycle', 'bycycle'])
+            FULL_LABEL_MAP = np.arange(len(LABEL_NAMES)).reshape(len(LABEL_NAMES), 1)
+            FULL_COLOR_MAP = label_to_color_image(FULL_LABEL_MAP)
         ############进行预处理？##############
         preprocess_dict = {'vgg16': vgg16.preprocess_input, 'resnet50': resnet50.preprocess_input}
         backbone_dict = {'vgg16': vgg16.VGG16, 'resnet50': resnet50.ResNet50}
@@ -367,6 +373,8 @@ class ActionPredict(object):
                         # bbox = list(map(int, bbox[0:4]))
                         b = list(map(int, b[0:4]))
                         ## img_data --- > mask_img_data (deeplabV3)
+                        if segmodel is None:
+                            raise RuntimeError('segmodel is not initialized for mask_cnn branch')
                         original_im = Image.fromarray(cv2.cvtColor(img_data, cv2.COLOR_BGR2RGB))
                         resized_im, seg_map = segmodel.run(original_im)
                         resized_im = np.array(resized_im)
@@ -400,6 +408,21 @@ class ActionPredict(object):
                         if flip_image:
                             img_features = cv2.flip(img_features, 1)
 
+                    elif crop_type == 'scene_context_cnn':
+                        # Global image features without semantic segmentation.
+                        img = image.load_img(imp, target_size=(224, 224))
+                        x = image.img_to_array(img)
+                        x = np.expand_dims(x, axis=0)
+                        x = tf.keras.applications.vgg19.preprocess_input(x)
+                        block4_pool_features = VGGmodel.predict(x)
+                        img_features = block4_pool_features
+                        img_features = tf.nn.avg_pool2d(img_features, ksize=[14, 14], strides=[1, 1, 1, 1],
+                                                        padding='VALID')
+                        img_features = tf.squeeze(img_features)
+                        img_features = img_features.numpy()
+                        if flip_image:
+                            img_features = cv2.flip(img_features, 1)
+
                     elif crop_type == 'mask':
                         img_data = cv2.imread(imp)
                         ori_dim = img_data.shape
@@ -408,6 +431,8 @@ class ActionPredict(object):
                         # bbox = list(map(int, bbox[0:4]))
                         b = list(map(int, b[0:4]))
                         ## img_data --- > mask_img_data (deeplabV3)
+                        if segmodel is None:
+                            raise RuntimeError('segmodel is not initialized for mask branch')
                         original_im = Image.fromarray(cv2.cvtColor(img_data, cv2.COLOR_BGR2RGB))
                         resized_im, seg_map = segmodel.run(original_im)
                         resized_im = np.array(resized_im)
@@ -839,6 +864,8 @@ class ActionPredict(object):
         elif 'surround' in feature_type:
             data_gen_params['crop_type'] = 'surround'
             data_gen_params['crop_resize_ratio'] = eratio
+        elif 'scene_context_cnn' in feature_type:
+            data_gen_params['crop_type'] = 'scene_context_cnn'
         elif 'scene_context' in feature_type:
             data_gen_params['crop_type'] = 'none'
         save_folder_name = feature_type
@@ -5660,10 +5687,10 @@ class MASK_PCPA_4_2D(ActionPredict):
         encoder_outputs.append(x)
         """
 
-        # A分支：local context (+ mask if存在)
+        # A分支：local context (+ second visual branch if provided)
         xA = self._rnn(name='enc0_' + data_types[0], r_sequence=return_sequence)(network_inputs[0])
 
-        if core_size >= 2 and data_types[1] == 'mask_cnn':
+        if core_size >= 2 and data_types[1] in ['mask_cnn', 'scene_context_cnn']:
             x = self._rnn(name='enc1_' + data_types[1], r_sequence=return_sequence)(network_inputs[1])
             xA = Concatenate(name='concat_A', axis=2)([xA, x])
             xA = self._rnn(name='encA', r_sequence=return_sequence)(xA)
@@ -5833,15 +5860,108 @@ class MASK_PCPA_4_2D(ActionPredict):
         num_classes = test_results.shape[1]
 
         acc = accuracy_score(y_true, y_pred)
+        class_ids = list(range(num_classes))
+        y_true_onehot = np.eye(num_classes, dtype=np.float32)[y_true]
+
+        # Per-class precision / recall / f1.
+        per_class_precision = np.asarray(
+            precision_score(y_true, y_pred, labels=class_ids, average=None, zero_division=0), dtype=np.float32)
+        per_class_recall = np.asarray(
+            recall_score(y_true, y_pred, labels=class_ids, average=None, zero_division=0), dtype=np.float32)
+        per_class_f1 = np.asarray(
+            f1_score(y_true, y_pred, labels=class_ids, average=None, zero_division=0), dtype=np.float32)
+
+        # Weighted summary metrics.
+        precision_weighted = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+        recall_weighted = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+        f1_weighted = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+
+        # Cohen's kappa.
+        kappa = cohen_kappa_score(y_true, y_pred)
+
+        # Per-class AUC (one-vs-rest).
+        per_class_auc = {}
+        auc_values = []
+        for cls in class_ids:
+            y_true_cls = (y_true == cls).astype(np.int32)
+            # AUC is undefined if a class has only one label type in test split.
+            if np.unique(y_true_cls).size < 2:
+                per_class_auc[cls] = float('nan')
+                continue
+            auc_cls = roc_auc_score(y_true_cls, test_results[:, cls])
+            per_class_auc[cls] = float(auc_cls)
+            auc_values.append(float(auc_cls))
+        auc = float(np.mean(auc_values)) if len(auc_values) > 0 else float('nan')
+
+        # Cross-entropy (log loss): mean over samples and per-sample values.
+        eps = 1e-12
+        ce_per_sample = -np.log(np.clip(test_results[np.arange(len(y_true)), y_true], eps, 1.0))
+        ce_mean = float(np.mean(ce_per_sample)) if ce_per_sample.size > 0 else float('nan')
+        ce_std = float(np.std(ce_per_sample)) if ce_per_sample.size > 0 else float('nan')
         try:
-            y_true_onehot = np.eye(num_classes)[y_true]
-            auc = roc_auc_score(y_true_onehot, test_results, multi_class='ovr')
+            ce_log_loss = float(log_loss(y_true, test_results, labels=class_ids))
         except ValueError:
-            # Some classes can be absent in a split; keep the pipeline running.
-            auc = float('nan')
-        f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
-        precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
-        recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
+            print("log loss is setted to mean value")
+            ce_log_loss = ce_mean
+
+        # Confusion matrix.
+        cm = confusion_matrix(y_true, y_pred, labels=class_ids)
+
+        # Save confusion matrix plot.
+        cm_fig_path = os.path.join(model_path, 'confusion_matrix.png')
+        plt.figure(figsize=(8, 6))
+        plt.imshow(cm, interpolation='nearest', cmap='Blues')
+        plt.title('Confusion Matrix')
+        plt.colorbar()
+        tick_marks = np.arange(num_classes)
+        plt.xticks(tick_marks, tick_marks)
+        plt.yticks(tick_marks, tick_marks)
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        thresh = cm.max() / 2.0 if cm.size > 0 else 0
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                plt.text(j, i, format(cm[i, j], 'd'),
+                         ha='center', va='center',
+                         color='white' if cm[i, j] > thresh else 'black')
+        plt.tight_layout()
+        plt.savefig(cm_fig_path, dpi=200)
+        plt.close()
+
+        # Save one-vs-rest ROC curves.
+        roc_fig_path = os.path.join(model_path, 'roc_curves_ovr.png')
+        plt.figure(figsize=(8, 6))
+        has_valid_roc = False
+        for cls in class_ids:
+            y_true_cls = (y_true == cls).astype(np.int32)
+            if np.unique(y_true_cls).size < 2:
+                continue
+            fpr, tpr, _ = roc_curve(y_true_cls, test_results[:, cls])
+            auc_cls = per_class_auc[cls]
+            plt.plot(fpr, tpr, lw=1.5, label='Class {} (AUC={:.3f})'.format(cls, auc_cls))
+            has_valid_roc = True
+        plt.plot([0, 1], [0, 1], 'k--', lw=1)
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('One-vs-Rest ROC Curves')
+        if has_valid_roc:
+            plt.legend(loc='lower right', fontsize=8)
+        plt.tight_layout()
+        plt.savefig(roc_fig_path, dpi=200)
+        plt.close()
+
+        # Print only requested aggregate metrics.
+        print('acc:{:.4f} precision_weighted:{:.4f} recall_weighted:{:.4f} f1_weighted:{:.4f} '
+              'kappa:{:.4f} auc_mean_per_class:{:.4f} ce_mean:{:.6f} ce_std:{:.6f}'.format(
+            acc,
+            precision_weighted,
+            recall_weighted,
+            f1_weighted,
+            kappa,
+            auc if not np.isnan(auc) else -1.0,
+            ce_mean if not np.isnan(ce_mean) else -1.0,
+            ce_std if not np.isnan(ce_std) else -1.0))
+        print('saved figures: {}, {}'.format(cm_fig_path, roc_fig_path))
         
         # THIS IS TEMPORARY, REMOVE BEFORE RELEASE
         with open(os.path.join(model_path, 'test_output.pkl'), 'wb') as picklefile:
@@ -5850,24 +5970,44 @@ class MASK_PCPA_4_2D(ActionPredict):
                          'gt': y_true,
                          'y_prob': test_results,
                          'y_pred': y_pred,
+                         'confusion_matrix': cm,
+                         'ce_per_sample': ce_per_sample,
                          'image': test_data['image']}, picklefile)
 
+        # Save summary metrics to CSV (instead of YAML).
+        summary_csv_path = os.path.join(model_path, 'metrics_summary.csv')
+        with open(summary_csv_path, 'w') as fid:
+            fid.write('acc,precision_weighted,recall_weighted,f1_weighted,kappa,auc_mean_per_class,ce_mean,ce_std,ce_log_loss,confusion_matrix_plot,roc_ovr_plot\n')
+            fid.write('{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{},{}\n'.format(
+                float(acc),
+                float(precision_weighted),
+                float(recall_weighted),
+                float(f1_weighted),
+                float(kappa),
+                float(auc) if not np.isnan(auc) else float('nan'),
+                float(ce_mean) if not np.isnan(ce_mean) else float('nan'),
+                float(ce_std) if not np.isnan(ce_std) else float('nan'),
+                float(ce_log_loss) if not np.isnan(ce_log_loss) else float('nan')))
 
-        print('acc:{:.2f} auc_ovr:{:.2f} f1_macro:{:.2f} precision_macro:{:.2f} recall_macro:{:.2f}'.format(
-            acc, auc if not np.isnan(auc) else -1, f1, precision, recall))
+        # Save per-class metrics to CSV.
+        per_class_csv_path = os.path.join(model_path, 'per_class_metrics.csv')
+        with open(per_class_csv_path, 'w') as fid:
+            fid.write('class_id,precision,recall,f1,auc\n')
+            for cls in class_ids:
+                cls_auc = per_class_auc[cls]
+                fid.write('{},{:.10f},{:.10f},{:.10f},{}\n'.format(
+                    cls,
+                    float(per_class_precision[int(cls)]),
+                    float(per_class_recall[int(cls)]),
+                    float(per_class_f1[int(cls)]),
+                    '{:.10f}'.format(float(cls_auc)) if not np.isnan(cls_auc) else 'nan'))
 
-        save_results_path = os.path.join(model_path, '{:.2f}'.format(acc) + '.yaml')
+        # Save confusion matrix values to CSV.
+        cm_csv_path = os.path.join(model_path, 'confusion_matrix.csv')
+        np.savetxt(cm_csv_path, cm, fmt='%d', delimiter=',')
 
-        if not os.path.exists(save_results_path):
-            results = {'acc': acc,
-                       'auc_ovr': auc,
-                       'f1_macro': f1,
-                       'precision_macro': precision,
-                       'recall_macro': recall}
-
-            with open(save_results_path, 'w') as fid:
-                yaml.dump(results, fid)
-        return acc, auc, f1, precision, recall
+        print('saved csv: {}, {}, {}'.format(summary_csv_path, per_class_csv_path, cm_csv_path))
+        return acc, auc, f1_weighted, precision_weighted, recall_weighted
 
 
 
