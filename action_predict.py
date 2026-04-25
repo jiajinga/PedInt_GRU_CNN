@@ -51,7 +51,6 @@ from tensorflow.keras.applications.vgg19 import VGG19
 from tensorflow.keras.preprocessing import image
 from tensorflow.keras.applications.vgg19 import preprocess_input
 from tensorflow.keras.models import Model
-import numpy as np
 
 
 #####################语义分割##########################
@@ -99,7 +98,9 @@ class DeepLabModel(object):
         width, height = image.size
         resize_ratio = 1.0 * self.INPUT_SIZE / max(width, height)
         target_size = (int(resize_ratio * width), int(resize_ratio * height))
-        resized_image = image.convert('RGB').resize(target_size, Image.ANTIALIAS)
+        # Pillow>=10 removed Image.ANTIALIAS; keep compatibility with both versions.
+        resample_method = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS
+        resized_image = image.convert('RGB').resize(target_size, resample_method)
         batch_seg_map = self.sess.run(
             self.OUTPUT_TENSOR_NAME,
             feed_dict={self.INPUT_TENSOR_NAME: [np.asarray(resized_image)]})
@@ -643,10 +644,11 @@ class ActionPredict(object):
         d = {'center': data_raw['center'].copy(),
              'box': data_raw['bbox'].copy(),
              'ped_id': data_raw['pid'].copy(),
-             'crossing': data_raw['activities'].copy(),
+             # TODO: 这里的 crossing 得改成 dir_intent
+             'dir_intent': data_raw['dir_intent'].copy(),
              'image': data_raw['image'].copy()}
 
-        balance = opts['balance_data'] if data_type == 'train' else False
+        balance = opts['balance_data'] if data_type == 'train' else False  # 默认是 false
         obs_length = opts['obs_length']
         time_to_event = opts['time_to_event']
         normalize = opts['normalize_boxes']
@@ -663,6 +665,7 @@ class ActionPredict(object):
         d['box_org'] = d['box'].copy()
         d['tte'] = []   # time to event
 
+        # 下面这段本质上就是对轨迹进行裁切、窗口化，某种意义上算是数据增强
         # time to event 的处理，如果 time_to_event 是一个整数，说明我们只关心一个特定的时间点，
         # 那么我们就从每个序列中提取出这个时间点之前的 obs_length 长度的序列，并且将 time_to_event 作为标签；
         # 如果 time_to_event 是一个范围，说明我们关心这个范围内的所有时间点，
@@ -679,6 +682,9 @@ class ActionPredict(object):
             for k in d.keys():
                 seqs = []
                 for seq in d[k]:
+                    # TODO: 有时候 len(seq) 可能和 time_to_event[1] 相差不大，甚至更小，亦或者只比 time_to_event[0] 大一点点，
+                    #  这时候这个 idx 可能取负，虽然能够正常运行下去，但是结果可能还是有问题的，其所代表的含义改变了，
+                    #  考虑直接设置 time_to_event为一个整数30
                     start_idx = len(seq) - obs_length - time_to_event[1]
                     end_idx = len(seq) - obs_length - time_to_event[0]
                     # 这里一次性提取了多个观测窗口
@@ -691,16 +697,19 @@ class ActionPredict(object):
                 start_idx = len(seq) - obs_length - time_to_event[1]
                 end_idx = len(seq) - obs_length - time_to_event[0]
                 d['tte'].extend([[len(seq) - (i + obs_length)] for i in
-                                range(start_idx, end_idx + 1, olap_res)])
-        # 归一化
+                                range(start_idx, end_idx + 1, olap_res)])  # 应该是该窗口的起始帧到 event 的剩余帧数
+
+        # 获取相对于第一个的变化量
         if normalize:
             for k in d.keys():
                 if k != 'tte':
                     if k != 'box' and k != 'center':
+                        # 对 crossing, ped_id, image 直接去掉第一帧
                         for i in range(len(d[k])):
                             d[k][i] = d[k][i][1:]
                     else:
                         for i in range(len(d[k])):
+                            # 对 center, boxes 求每一帧相对于第一帧的变化量
                             d[k][i] = np.subtract(d[k][i][1:], d[k][i][0]).tolist()
                 d[k] = np.array(d[k])
         else:
@@ -708,12 +717,24 @@ class ActionPredict(object):
                 d[k] = np.array(d[k])
 
         # crossing 标签的处理，提取出 crossing 标签的第一个元素作为最终的标签，并且统计正负样本的数量
-        d['crossing'] = np.array(d['crossing'])[:, 0, :]
-        pos_count = np.count_nonzero(d['crossing'])
-        neg_count = len(d['crossing']) - pos_count
-        print("Negative {} and positive {} sample counts".format(neg_count, pos_count))
+        # d['crossing'] = np.array(d['crossing'])[:, 0, :]
+        d['dir_intent'] = np.array(d['dir_intent'])[:, 0, :]
 
-        return d, neg_count, pos_count
+        class_counts = [0] * 9
+        flat_labels = np.array(d['dir_intent']).reshape(-1)
+        for label in flat_labels:
+            try:
+                if np.isnan(label):
+                    continue
+                label_int = int(label)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= label_int <= 8:
+                class_counts[label_int] += 1
+
+        print("-----Different class sample counts (0-8): {}-----".format(class_counts))
+
+        return d, class_counts
 
     # 让数据均衡，通过重采样
     def balance_data_samples(self, d, img_width, balance_tag='crossing'):
@@ -857,9 +878,9 @@ class ActionPredict(object):
         data_type_sizes_dict = {}
         process = model_opts.get('process', True)
         dataset = model_opts['dataset']
-        data, neg_count, pos_count = self.get_data_sequence(data_type, data_raw, model_opts)
+        data, class_counts = self.get_data_sequence(data_type, data_raw, model_opts)
 
-        data_type_sizes_dict['box'] = data['box'].shape[1:]
+        data_type_sizes_dict['box'] = data['box'].shape[1:]   # 记录每一个行人的边界框size=[Fn,4]
         if 'speed' in data.keys():
             data_type_sizes_dict['speed'] = data['speed'].shape[1:]
 
@@ -891,23 +912,23 @@ class ActionPredict(object):
         # create the final data file to be returned
         if self._generator:
             _data = (DataGenerator(data=_data,
-                                   labels=data['crossing'],
+                                   labels=data['dir_intent'],
                                    data_sizes=data_sizes,
                                    process=process,
                                    global_pooling=self._global_pooling,
                                    input_type_list=model_opts['obs_input_type'],
                                    batch_size=model_opts['batch_size'],
                                    shuffle=data_type != 'test',
-                                   to_fit=data_type != 'test'), data['crossing']) # set y to None
+                                   to_fit=data_type != 'test'), data['dir_intent']) # set y to None
         else:
-            _data = (_data, data['crossing'])
+            _data = (_data, data['dir_intent'])
 
         return {'data': _data,
                 'ped_id': data['ped_id'],
                 'image': data['image'],
                 'tte': data['tte'],
                 'data_params': {'data_types': data_types, 'data_sizes': data_sizes},
-                'count': {'neg_count': neg_count, 'pos_count': pos_count}}
+                'count': class_counts }
 
     # 记录模型的配置和训练参数，存放在configs.yaml
     def log_configs(self, config_path, batch_size, epochs,
@@ -943,7 +964,7 @@ class ActionPredict(object):
 
         print('Wrote configs to {}'.format(config_path))
 
-    # 对每个类别增加权重（后期如果改变类别数量需要修改该函数）
+    # TODO: 对每个类别增加权重（后期如果改变类别数量需要修改该函数）
     def class_weights(self, apply_weights, sample_count):
         """
         Computes class weights for imbalanced data used during training
@@ -956,17 +977,54 @@ class ActionPredict(object):
         if not apply_weights:
             return None
 
-        total = sample_count['neg_count'] + sample_count['pos_count']
-        # formula from sklearn
-        #neg_weight = (1 / sample_count['neg_count']) * (total) / 2.0
-        #pos_weight = (1 / sample_count['pos_count']) * (total) / 2.0
-        
-        # use simple ratio
-        neg_weight = sample_count['pos_count']/total
-        pos_weight = sample_count['neg_count']/total
+        if sample_count is None:
+            print('Class weights skipped: sample_count is None')
+            return None
 
-        print("### Class weights: negative {:.3f} and positive {:.3f} ###".format(neg_weight, pos_weight))
-        return {0: neg_weight, 1: pos_weight}
+        # Support both binary dict counts and multi-class list/array counts.
+        if isinstance(sample_count, dict):
+            if 'neg_count' in sample_count and 'pos_count' in sample_count:
+                counts = np.array([sample_count['neg_count'], sample_count['pos_count']], dtype=np.float32)
+            else:
+                try:
+                    sorted_keys = sorted(sample_count.keys())
+                    counts = np.array([sample_count[k] for k in sorted_keys], dtype=np.float32)
+                except Exception:
+                    print('Class weights skipped: unsupported sample_count dict format')
+                    return None
+        else:
+            try:
+                counts = np.asarray(sample_count, dtype=np.float32).reshape(-1)
+            except Exception:
+                print('Class weights skipped: sample_count is not convertible to numeric array')
+                return None
+
+        if counts.size == 0:
+            print('Class weights skipped: empty sample_count')
+            return None
+
+        counts = np.nan_to_num(counts, nan=0.0, posinf=0.0, neginf=0.0)
+        counts[counts < 0] = 0
+
+        total_samples = float(np.sum(counts))
+        n_classes = int(counts.shape[0])
+
+        if total_samples <= 0 or n_classes == 0:
+            print('Class weights skipped: no valid samples found')
+            return None
+
+        weights = np.zeros_like(counts, dtype=np.float32)
+        nonzero_mask = counts > 0
+        weights[nonzero_mask] = total_samples / (n_classes * counts[nonzero_mask])
+
+        zero_classes = np.where(~nonzero_mask)[0].tolist()
+        if zero_classes:
+            print('Class {} have zero samples. Setting their class weights to 0.'.format(zero_classes))
+
+        class_weight_dict = {i: float(weights[i]) for i in range(n_classes)}
+        formatted = [f"{w:.4f}" for w in weights]
+        print(f"-----------权重-----------{formatted}")
+        return class_weight_dict
 
     # 记录训练过程的反馈
     def get_callbacks(self, learning_scheduler, model_path):
@@ -5470,10 +5528,10 @@ class MASK_PCPA_4_2D(ActionPredict):
         super().__init__(**kwargs)
         # Network parameters
         self._num_hidden_units = num_hidden_units
-        self._rnn = self._gru if cell_type == 'gru' else self._lstm
+        self._rnn = self._gru if cell_type == 'gru' else self._lstm  # default: GRU
         self._rnn_cell = GRUCell if cell_type == 'gru' else LSTMCell
         # assert self._backbone in ['c3d', 'i3d'], 'Incorrect backbone {}! Should be C3D or I3D'.format(self._backbone)
-        self._3dconv = C3DNet if self._backbone == 'c3d' else I3DNet
+        self._3dconv = C3DNet if self._backbone == 'c3d' else I3DNet  # backbone default: vgg
 
         # dropout = 0.0,
         # dense_activation = 'sigmoid',
@@ -5497,7 +5555,7 @@ class MASK_PCPA_4_2D(ActionPredict):
         data_type_sizes_dict = {}
         process = model_opts.get('process', True)
         dataset = model_opts['dataset']
-        data, neg_count, pos_count = self.get_data_sequence(data_type, data_raw, model_opts)
+        data, class_counts = self.get_data_sequence(data_type, data_raw, model_opts)
 
         data_type_sizes_dict['box'] = data['box'].shape[1:]
         if 'speed' in data.keys():
@@ -5512,7 +5570,9 @@ class MASK_PCPA_4_2D(ActionPredict):
 
         model_opts_3d = model_opts.copy()
 
+        # model_opts['obs_input_type'] = [local_context_cnn, mask_cnn, pose, box, speed]
         for d_type in model_opts['obs_input_type']:
+            # 对第一个（行人周围的局部CNN特征）和第二个（全局语义分割特征）
             if 'local' in d_type or 'context' in d_type or 'mask' in d_type:
                 if self._backbone == 'c3d':
                     model_opts_3d['target_dim'] = (112, 112)
@@ -5537,24 +5597,27 @@ class MASK_PCPA_4_2D(ActionPredict):
         # create the final data file to be returned
         if self._generator:
             _data = (DataGenerator(data=_data,
-                                   labels=data['crossing'],
+                                   # TODO: 这里得把crossing都换成咱们的dir_intent
+                                   labels=data['dir_intent'],
                                    data_sizes=data_sizes,
                                    process=process,
                                    global_pooling=None,
                                    input_type_list=model_opts['obs_input_type'],
                                    batch_size=model_opts['batch_size'],
                                    shuffle=data_type != 'test',
-                                   to_fit=data_type != 'test'), data['crossing'])  # set y to None
+                                   to_fit=data_type != 'test'), data['dir_intent'])  # set y to None
         # global_pooling=self._global_pooling,
         else:
-            _data = (_data, data['crossing'])
+            _data = (_data, data['dir_intent'])
 
         return {'data': _data,
                 'ped_id': data['ped_id'],
                 'tte': data['tte'],
                 'image': data['image'],
-                'data_params': {'data_types': data_types, 'data_sizes': data_sizes},
-                'count': {'neg_count': neg_count, 'pos_count': pos_count}}
+            'data_params': {'data_types': data_types,
+                    'data_sizes': data_sizes,
+                    'num_classes': model_opts.get('num_classes', 9)},
+                'count': class_counts }
 
     def get_model(self, data_params):
         return_sequence = True
@@ -5642,8 +5705,9 @@ class MASK_PCPA_4_2D(ActionPredict):
             encodings = encoder_outputs[0]
             encodings = attention_3d_block(encodings, dense_size=attention_size, modality='_modality')
 
-        # 过一遍FC就可以输出结果了
-        model_output = Dense(1, activation='sigmoid',
+        # 过一遍FC输出多分类结果
+        num_classes = data_params.get('num_classes', 9)
+        model_output = Dense(num_classes, activation='softmax',
                              name='output_dense',
                              activity_regularizer=regularizers.l2(0.001))(encodings)
 
@@ -5652,6 +5716,158 @@ class MASK_PCPA_4_2D(ActionPredict):
         net_model.summary()
         plot_model(net_model, to_file='model_imgs/MASK_PCPA_4_2D.png')
         return net_model
+    
+    # 模型训练函数，获取数据->创建模型->训练模型->保存模型和训练历史记录
+    def train(self, data_train,
+              data_val,
+              batch_size=2,
+              epochs=60,
+              lr=0.000005,
+              optimizer='adam',
+              learning_scheduler=None,
+              model_opts=None):
+        """
+        Train the models
+        Args:
+            data_train: Training data
+            data_val: Validation data
+            batch_size: Batch size for training
+            epochs: Number of epochs to train
+            lr: Learning rate
+            optimizer: Optimizer for training
+            learning_scheduler: Whether to use learning schedulers
+            model_opts: Model options
+        Returns:
+            The path to the root folder of models
+        """
+        learning_scheduler = learning_scheduler or {}
+        # ---Set the path for saving models---
+        model_folder_name = time.strftime("%d%b%Y-%Hh%Mm%Ss")
+        path_params = {'save_folder': os.path.join(self.__class__.__name__, model_folder_name),
+                       'save_root_folder': 'data/models/',
+                       'dataset': model_opts['dataset']}
+        model_path, _ = get_path(**path_params, file_name='model.h5')
+
+        # ---Read train and validation data---
+        model_opts = {**model_opts, 'num_classes': model_opts.get('num_classes', 9)}
+        data_train = self.get_data('train', data_train, {**model_opts, 'batch_size': batch_size}) 
+
+        if data_val is not None:
+            data_val = self.get_data('val', data_val, {**model_opts, 'batch_size': batch_size})['data']
+            if self._generator:  # 生成器，最后似乎返回的是一个生成器对象，images，可以 yield (x,y)
+                data_val = data_val[0]
+
+        # ---Create model---
+        train_model = self.get_model(data_train['data_params'])
+
+        # ---Train the model, here first to configure the model---
+        class_w = self.class_weights(model_opts['apply_class_weights'], data_train['count'])
+        optimizer = self.get_optimizer(optimizer)(lr=lr)
+        train_model.compile(loss='sparse_categorical_crossentropy',
+                    optimizer=optimizer,
+                    metrics=['sparse_categorical_accuracy'])
+        # compile是 Keras 模型的编译函数，指定损失函数、优化器和评估指标等参数，设置模型状态
+        ## ---reivse fit---
+        callbacks = self.get_callbacks(learning_scheduler, model_path)
+
+        # data_val = data_val.batch(batch_size)
+        # 这里的
+        # ---start to train---
+        history = train_model.fit(x=data_train['data'][0],  # fit 是 Keras 模型的训练函数，输入训练数据、标签、批大小、迭代次数、验证数据、类别权重、回调函数等参数，返回训练历史记录
+                                  y=None if self._generator else data_train['data'][1],
+                                  batch_size=None, # 如果使用生成器，数据已经在生成器中被批处理了，所以不需要在这里再指定批大小了
+                                  epochs=epochs,
+                                  validation_data=data_val,
+                                  class_weight=class_w,
+                                  verbose=1,
+                                  callbacks=callbacks)
+        # 当缺失模型保存检查点时，手动保存模型
+        if 'checkpoint' not in learning_scheduler:
+            print('Train model is saved to {}'.format(model_path))
+            train_model.save(model_path)
+
+        # ---Save data options and configurations---
+        model_opts_path, _ = get_path(**path_params, file_name='model_opts.pkl')
+        with open(model_opts_path, 'wb') as fid:
+            pickle.dump(model_opts, fid, pickle.HIGHEST_PROTOCOL)
+
+        config_path, _ = get_path(**path_params, file_name='configs.yaml')
+        self.log_configs(config_path, batch_size, epochs,
+                         lr, model_opts)
+
+        # ---Save training history---
+        history_path, saved_files_path = get_path(**path_params, file_name='history.pkl')
+        with open(history_path, 'wb') as fid:
+            pickle.dump(history.history, fid, pickle.HIGHEST_PROTOCOL)
+
+        return saved_files_path
+
+    # 模型测试函数
+    def test(self, data_test, model_path=''):
+        """
+        Evaluate a given model
+        Args:
+            data_test: Test data
+            model_path: Path to folder containing the model and options
+            save_results: Save output of the model for visualization and analysis
+        Returns:
+            Evaluation metrics
+        """
+        with open(os.path.join(model_path, 'configs.yaml'), 'r') as fid:
+            opts = yaml.safe_load(fid)
+            # try:
+            #     model_opts = pickle.load(fid)
+            # except:
+            #     model_opts = pickle.load(fid, encoding='bytes')
+
+        test_model = load_model(os.path.join(model_path, 'model.h5'))
+        test_model.summary()
+
+        model_opts = {**opts['model_opts'], 'num_classes': opts['model_opts'].get('num_classes', 9)}
+        test_data = self.get_data('test', data_test, {**model_opts, 'batch_size': 1})
+
+        test_results = test_model.predict(test_data['data'][0],
+                                          batch_size=1, verbose=1)
+        y_true = np.array(test_data['data'][1]).reshape(-1).astype(np.int32)
+        y_pred = np.argmax(test_results, axis=1).astype(np.int32)
+        num_classes = test_results.shape[1]
+
+        acc = accuracy_score(y_true, y_pred)
+        try:
+            y_true_onehot = np.eye(num_classes)[y_true]
+            auc = roc_auc_score(y_true_onehot, test_results, multi_class='ovr')
+        except ValueError:
+            # Some classes can be absent in a split; keep the pipeline running.
+            auc = float('nan')
+        f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+        recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
+        
+        # THIS IS TEMPORARY, REMOVE BEFORE RELEASE
+        with open(os.path.join(model_path, 'test_output.pkl'), 'wb') as picklefile:
+            pickle.dump({'tte': test_data['tte'],
+                         'pid': test_data['ped_id'],
+                         'gt': y_true,
+                         'y_prob': test_results,
+                         'y_pred': y_pred,
+                         'image': test_data['image']}, picklefile)
+
+
+        print('acc:{:.2f} auc_ovr:{:.2f} f1_macro:{:.2f} precision_macro:{:.2f} recall_macro:{:.2f}'.format(
+            acc, auc if not np.isnan(auc) else -1, f1, precision, recall))
+
+        save_results_path = os.path.join(model_path, '{:.2f}'.format(acc) + '.yaml')
+
+        if not os.path.exists(save_results_path):
+            results = {'acc': acc,
+                       'auc_ovr': auc,
+                       'f1_macro': f1,
+                       'precision_macro': precision,
+                       'recall_macro': recall}
+
+            with open(save_results_path, 'w') as fid:
+                yaml.dump(results, fid)
+        return acc, auc, f1, precision, recall
 
 
 

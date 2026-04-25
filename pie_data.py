@@ -95,6 +95,7 @@ class PIE(object):
                           'all': ['set01', 'set02', 'set03',
                                   'set04', 'set05', 'set06']}"""
         image_set_nums = {'train': ['set01'],
+                          'val': ['set05'],
                           'test': ['set02'],
                           'all': ['set01', 'set02']}
         return image_set_nums[image_set]
@@ -368,13 +369,13 @@ class PIE(object):
                     annotations[ped_annt][obj_id]['bbox'].append(
                         [float(b.get('xtl')), float(b.get('ytl')),
                          float(b.get('xbr')), float(b.get('ybr'))])
-                    occ = self._map_text_to_scalar('occlusion', b.find('./attribute[@name=\"occlusion\"]').text)
-                    annotations[ped_annt][obj_id]['occlusion'].append(occ)
+                    # occ = self._map_text_to_scalar('occlusion', b.find('./attribute[@name=\"occlusion\"]').text)
+                    # annotations[ped_annt][obj_id]['occlusion'].append(occ)
                     annotations[ped_annt][obj_id]['frames'].append(int(b.get('frame')))
-                    for beh in annotations['ped_annotations'][obj_id]['behavior']:
+                    # for beh in annotations['ped_annotations'][obj_id]['behavior']:
                         # Read behavior tags for each frame and add to the database
-                        annotations[ped_annt][obj_id]['behavior'][beh].append(
-                            self._map_text_to_scalar(beh, b.find('./attribute[@name=\"' + beh + '\"]').text))
+                        # annotations[ped_annt][obj_id]['behavior'][beh].append(
+                            # self._map_text_to_scalar(beh, b.find('./attribute[@name=\"' + beh + '\"]').text))
 
             else:
                 obj_type = boxes[0].find('./attribute[@name=\"type\"]')

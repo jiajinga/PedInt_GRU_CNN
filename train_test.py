@@ -91,7 +91,7 @@ def run(config_file=None):
     """
     print(config_file)
     # Read default Config file   设置最基础的训练参数
-    configs_default ='config_files/configs_default.yaml'
+    configs_default ='config_files_pie/configs_default.yaml'
     with open(configs_default, 'r') as f:
         configs = yaml.safe_load(f)
     # 模型具体参数
