@@ -639,7 +639,10 @@ def process_video(video_path: str,
 
     for i in short_track_id:
         del track_histories[i]
-    # save_results_to_json(track_histories, r"filtered_tracks.json")
+    v_num = (os.path.normpath(video_path).split(os.sep)[-2][-1]+'_'+
+             os.path.normpath(video_path).split(os.sep)[-1][8:10])
+    output_path = "filtered_tracks_"+v_num+".json"
+    save_results_to_json(track_histories, output_path)
     print(f"过滤短时轨迹，数量为{len(short_track_id)}")
 
     # 处理完一个视频后重置跟踪器，避免 ID 混乱
@@ -834,7 +837,7 @@ def compute_pixel_displacement_pie(
                        [-np.sin(dyaw), 0, np.cos(dyaw)]])
     R_pitch = np.array([[1, 0, 0],
                         [0, np.cos(pitch := np.deg2rad(cam_pitch_deg)), -np.sin(pitch)],
-                        [0, np.sin(pitch), np.cos(pitch)]])
+                        [0, np.sin(pitch), np.cos(pitch)]])   # 理论上-10代表相机向下俯，这里用的时候可能就代表向上仰了，因为顺时针为正，但是测试了结果感觉也不对，可能其他地方还有问题
     R_wc1 = R_pitch @ R_yaw1.T @ Ri  # 世界坐标系到第一帧相机坐标系的旋转矩阵
     R_wc2 = R_pitch @ R_yaw2.T @ Ri  # 世界坐标系到当前帧相机坐标系的旋转矩阵
     R_rel = R_wc2 @ R_wc1.T  # 第一帧相机坐标系到当前帧相机坐标系的旋转矩阵
@@ -1329,18 +1332,22 @@ def process_dataset(video_root: str, anno_root: str, camera_param_path: str, out
         # animate_optical_flow(video_path)
 
         # Track objects in video and get their histories，这里应该是相当于获取行人的轨迹，行人轨迹已经合并了，并且生成的是新的id
-        # track_histories, camera = process_video(video_path)
+        v_num = (os.path.normpath(video_path).split(os.sep)[-2][-1] + '_' +
+                 os.path.normpath(video_path).split(os.sep)[-1][8:10])
+        if os.path.isfile("filtered_tracks_" + v_num + ".json"):
+            track_histories = load_json("filtered_tracks_" + v_num + ".json")
+        else:
+            track_histories = process_video(video_path)
 
         # 如果出错了，就使用这个函数加载
-        track_histories = load_json(r"filtered_tracks.json")
+        #
 
         # Plot 3D tracks for this sample，这是在 for 循环里的啊
         # plot_3d_tracks(track_histories, f"Object Tracks - Sample {sample_id}")
 
         # Match objects using Hungarian algorithm
         matches = match_objects(track_histories, output_data)
-        if len(matches) < len(output_data):
-            unmatch = {}
+        unmatch = {}
 
         # 获取相机帧间物理位移（北东方向）
         vehicle = parse_vehicle(sample_data['vehicle_path'])
@@ -1414,10 +1421,10 @@ def process_dataset(video_root: str, anno_root: str, camera_param_path: str, out
 
 
 def main():
-    video_path = r"PIE\video"
-    anno_path = r"PIE\annotations"
-    output_dir = r"PIE\annotations\new_annotations"
-    camera_param_path = r"PIE\camera_params\calibration_data.json"
+    video_path = r"..\PIE\PIE_clips"
+    anno_path = r"..\PIE\annotations"
+    output_dir = r"..\PIE\annotations\new_annotations"
+    camera_param_path = r"..\PIE\camera_params\calibration_data.json"
     process_dataset(video_root=video_path, anno_root=anno_path, output_dir=output_dir,
                     camera_param_path=camera_param_path)
     # test_match(r"filtered_tracks.json", r"PIE/annotation/set02/video_0003_annt.xml")
@@ -1452,7 +1459,7 @@ def test_camera_motion(json_path):
 def test_intent_from_track(json_path, vehicle_path, calibration_json_path):
     all_tracks = load_json(json_path)
     # track_items = list(all_tracks.items())[:20]  # 依据这前 20 个样本确定分类准则
-    track_items = parse_pedestrians(r"PIE/annotation/set02/video_0003_annt.xml")
+    track_items = parse_pedestrians(r"PIE/annotations/annotations/set02/video_0003_annt.xml")
 
     vehicle = parse_vehicle(vehicle_path)
     camera = build_camera_displacements_corrected(vehicle, calibration_json_path)
@@ -1466,14 +1473,14 @@ def test_intent_from_track(json_path, vehicle_path, calibration_json_path):
         # print(checkpoint)
         checkpoints[str(track_id)] = checkpoint
 
-    save_checkpoints_to_excel(checkpoints, "intent_tests.xlsx")
+    save_checkpoints_to_excel(checkpoints, "intent_tests2.xlsx")
 
 
 if __name__ == "__main__":
     main()
     # test_camera_motion(r"filtered_tracks.json")
     '''test_intent_from_track(r"filtered_tracks.json",
-                           r"PIE/annotation_vehicle/set02/video_0003_obd.xml",
+                           r"PIE/annotations/annotations_vehicle/set02/video_0003_obd.xml",
                            r"PIE/camera_params/calibration_data.json")'''
     # video_path = r"..\PIE\video"
     # anno_path = r"..\PIE\annotations"
