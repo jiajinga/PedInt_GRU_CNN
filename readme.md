@@ -145,7 +145,7 @@ MASK_PCPA_jaad_2d ---> PCPA + MASK (2DCNN + RNN) model:MASK_PCPA_4_2D  # ours
 To re-run test on the saved model use:  
 
 ```
-python test_model.py <saved_files_path>
+python test.py <saved_files_path>
 ```
 
 For example:  

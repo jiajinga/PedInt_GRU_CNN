@@ -1,6 +1,6 @@
 # 这个是针对有预训练模型的情况
 from action_predict import action_prediction
-# from pie_data import PIE
+from pie_data import PIE
 from jaad_data import JAAD
 import os
 import sys
@@ -17,7 +17,15 @@ for gpu in gpus:
 
 def test_model(saved_files_path=None):
 
-    with open(os.path.join(saved_files_path, 'configs.yaml'), 'r') as yamlfile:
+    if not saved_files_path:
+        raise ValueError("saved_files_path is required (folder containing configs.yaml/model files)")
+    if not os.path.isdir(saved_files_path):
+        raise FileNotFoundError(f"saved_files_path does not exist or is not a directory: {saved_files_path}")
+    configs_path = os.path.join(saved_files_path, 'configs.yaml')
+    if not os.path.isfile(configs_path):
+        raise FileNotFoundError(f"Missing configs.yaml under saved_files_path: {configs_path}")
+
+    with open(configs_path, 'r') as yamlfile:
         opts = yaml.safe_load(yamlfile)
     print(opts)
     model_opts = opts['model_opts']
@@ -29,14 +37,13 @@ def test_model(saved_files_path=None):
     data_opts['min_track_size'] = model_opts['obs_length'] + tte
 
     if model_opts['dataset'] == 'pie':
-            pass
-            # imdb = PIE(data_path=os.environ.copy()['PIE_PATH'])
-            # imdb.get_data_stats()
+        pie_path = os.environ.get('PIE_PATH', 'PIE')
+        imdb = PIE(data_path=pie_path)
     elif model_opts['dataset'] == 'jaad':
-            # imdb = JAAD(data_path=os.environ.copy()['JAAD_PATH'])
-            imdb = JAAD(data_path='/home/haolin/CITR/PedestrianActionBenchmark/JAAD/')
+        jaad_path = os.environ.get('JAAD_PATH', 'JAAD')
+        imdb = JAAD(data_path=jaad_path)
     else:
-            raise ValueError("{} dataset is incorrect".format(model_opts['dataset']))
+        raise ValueError("{} dataset is incorrect".format(model_opts['dataset']))
 
     method_class = action_prediction(model_opts['model'])(**net_opts)
     #beh_seq_train = imdb.generate_data_trajectory_sequence('train', **data_opts)
@@ -49,5 +56,8 @@ def test_model(saved_files_path=None):
 
 
 if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print('Usage: python test.py <saved_files_path>')
+        sys.exit(2)
     saved_files_path = sys.argv[1]
     test_model(saved_files_path=saved_files_path)
