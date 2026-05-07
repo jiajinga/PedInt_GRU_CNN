@@ -37,7 +37,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')#
 print(f"Using device: {device}")#
 
 # Initialize models
-yolo_model = YOLO('yolov8s.pt')#
+yolo_model = YOLO('yolo26m.pt')#
 
 
 # ---------------------- 输入输出模块 --------------------------
@@ -1421,10 +1421,10 @@ def process_dataset(video_root: str, anno_root: str, camera_param_path: str, out
 
 
 def main():
-    video_path = r"..\PIE\PIE_clips"
-    anno_path = r"..\PIE\annotations"
-    output_dir = r"..\PIE\annotations\new_annotations"
-    camera_param_path = r"..\PIE\camera_params\calibration_data.json"
+    video_path = r"PIE/PIE_clips"
+    anno_path = r"PIE/annotations"
+    output_dir = r"PIE/annotations/new_annotations"
+    camera_param_path = r"PIE/camera_params/calibration_data.json"
     process_dataset(video_root=video_path, anno_root=anno_path, output_dir=output_dir,
                     camera_param_path=camera_param_path)
     # test_match(r"filtered_tracks.json", r"PIE/annotation/set02/video_0003_annt.xml")

@@ -89,15 +89,15 @@ class PIE(object):
         :return: Set ids of the image set
         """
         # TODO: 这个数据集划分需要进行修改
-        """image_set_nums = {'train': ['set01', 'set02', 'set04'],
+        image_set_nums = {'train': ['set01', 'set02', 'set04'],
                           'val': ['set05', 'set06'],
                           'test': ['set03'],
                           'all': ['set01', 'set02', 'set03',
-                                  'set04', 'set05', 'set06']}"""
-        image_set_nums = {'train': ['set01'],
+                                  'set04', 'set05', 'set06']}
+        """image_set_nums = {'train': ['set01'],
                           'val': ['set05'],
                           'test': ['set02'],
-                          'all': ['set01', 'set02']}
+                          'all': ['set01', 'set02']}"""
         return image_set_nums[image_set]
 
     def _get_image_path(self, sid, vid, fid):

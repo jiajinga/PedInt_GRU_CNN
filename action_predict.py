@@ -40,6 +40,7 @@ import os
 import time
 import scipy.misc
 import cv2
+import pandas as pd
 
 # from tensorflow.compat.v1 import ConfigProto
 # from tensorflow.compat.v1 import InteractiveSession
@@ -53,7 +54,63 @@ from tensorflow.keras.preprocessing import image
 from tensorflow.keras.applications.vgg19 import preprocess_input
 from tensorflow.keras.models import Model
 
+def sparse_categorical_crossentropy_with_label_smoothing(label_smoothing=0.1):
+    """Compatibility helper for TF/Keras versions without label_smoothing support.
 
+    Expects sparse integer labels and softmax probabilities.
+    """
+    label_smoothing = float(label_smoothing)
+
+    def loss(y_true, y_pred):
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
+        y_pred = tf.clip_by_value(y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+        depth = tf.shape(y_pred)[-1]
+        y_true_onehot = tf.one_hot(y_true, depth)
+        smooth_positives = 1.0 - label_smoothing
+        smooth_negatives = label_smoothing / tf.cast(depth, tf.float32)
+        y_true_onehot = y_true_onehot * smooth_positives + smooth_negatives
+        return tf.keras.losses.categorical_crossentropy(y_true_onehot, y_pred)
+
+    return loss
+
+
+def sparse_categorical_crossentropy(label_smoothing=0.1):
+    """Backward-compatible alias for label-smoothed sparse cross-entropy."""
+    return sparse_categorical_crossentropy_with_label_smoothing(label_smoothing)
+
+
+def sparse_categorical_focal_loss(gamma=2.0, alpha=None, from_logits=False):
+    """Sparse focal loss for multi-class classification.
+
+    Args:
+        gamma: Focusing parameter. Larger values emphasize hard examples more.
+        alpha: Optional scalar or per-class weight list/array.
+        from_logits: Whether y_pred is logits.
+    """
+    gamma = float(gamma)
+    alpha_tensor = None
+    if alpha is not None:
+        alpha_tensor = tf.constant(np.asarray(alpha, dtype=np.float32))
+
+    def loss(y_true, y_pred):
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
+        if from_logits:
+            y_pred = tf.nn.softmax(y_pred, axis=-1)
+        y_pred = tf.clip_by_value(y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+
+        depth = tf.shape(y_pred)[-1]
+        y_true_onehot = tf.one_hot(y_true, depth)
+        p_t = tf.reduce_sum(y_true_onehot * y_pred, axis=-1)
+        focal_factor = tf.pow(1.0 - p_t, gamma)
+        loss_value = -tf.math.log(p_t) * focal_factor
+
+        if alpha_tensor is not None:
+            alpha_factor = tf.reduce_sum(y_true_onehot * alpha_tensor, axis=-1)
+            loss_value = loss_value * alpha_factor
+
+        return loss_value
+
+    return loss
 #####################语义分割##########################
 class DeepLabModel(object):
     """Class to load deeplab model and run inference."""
@@ -744,6 +801,19 @@ class ActionPredict(object):
         # crossing 标签的处理，提取出 crossing 标签的第一个元素作为最终的标签，并且统计正负样本的数量
         # d['crossing'] = np.array(d['crossing'])[:, 0, :]
         d['dir_intent'] = np.array(d['dir_intent'])[:, 0, :]
+
+        # Some tracks carry an invalid label of -1; drop them before feeding Keras
+        # so class-weight lookup and sparse labels stay within [0, 8].
+        label_values = np.asarray(d['dir_intent']).reshape(-1)
+        valid_mask = np.array([
+            False if pd.isna(label) else 0 <= int(label) <= 8
+            for label in label_values
+        ], dtype=bool)
+        invalid_count = int((~valid_mask).sum())
+        if invalid_count:
+            print('Dropping {} invalid dir_intent samples with labels outside [0, 8]'.format(invalid_count))
+            for k in d.keys():
+                d[k] = np.asarray(d[k])[valid_mask]
 
         class_counts = [0] * 9
         flat_labels = np.array(d['dir_intent']).reshape(-1)
@@ -3532,7 +3602,14 @@ def attention_3d_block(hidden_states, dense_size=128, modality=''):
     score = dot([score_first_part, h_t], [2, 1], name='attention_score'+modality)
     attention_weights = Activation('softmax', name='attention_weight'+modality)(score)
     # (batch_size, time_steps, hidden_size) dot (batch_size, time_steps) => (batch_size, hidden_size)
-    context_vector = dot([hidden_states, attention_weights], [1, 1], name='context_vector'+modality)
+    # context_vector = dot([hidden_states, attention_weights], [1, 1], name='context_vector'+modality)
+    # TODO: 如遇GPU报错
+    # Avoid batched GEMM here; some CUDA/cuBLAS combinations fail on this dot path.
+    context_vector = Lambda(
+        lambda x: K.sum(x[0] * K.expand_dims(x[1], axis=-1), axis=1),
+        output_shape=(hidden_size,),
+        name='context_vector' + modality
+    )([hidden_states, attention_weights])
     pre_activation = concatenate([context_vector, h_t], name='attention_output'+modality)
     attention_vector = Dense(dense_size, use_bias=False, activation='tanh', name='attention_vector'+modality)(pre_activation)
     return attention_vector
@@ -5606,6 +5683,7 @@ class MASK_PCPA_4_2D(ActionPredict):
                 model_opts_3d['process'] = False
                 features, feat_shape = self.get_context_data(model_opts_3d, data, data_type, d_type)
             elif 'pose' in d_type:
+                # TODO: 后期修改为 new_poses 文件夹，替换姿势特征
                 path_to_pose, _ = get_path(save_folder='poses',
                                            dataset=dataset,
                                            save_root_folder='data/features')
@@ -5741,7 +5819,7 @@ class MASK_PCPA_4_2D(ActionPredict):
         net_model = Model(inputs=network_inputs,
                           outputs=model_output)
         net_model.summary()
-        plot_model(net_model, to_file='model_imgs/MASK_PCPA_4_2D.png')
+        # plot_model(net_model, to_file='model_imgs/MASK_PCPA_4_2D.png')
         return net_model
     
     # 模型训练函数，获取数据->创建模型->训练模型->保存模型和训练历史记录
@@ -5768,12 +5846,24 @@ class MASK_PCPA_4_2D(ActionPredict):
             The path to the root folder of models
         """
         learning_scheduler = learning_scheduler or {}
+        if not learning_scheduler:
+            learning_scheduler = {
+                'early_stop': {'monitor': 'val_loss', 'min_delta': 0.001, 'patience': 10,
+                               'verbose': 1, 'restore_best_weights': True},
+                'plateau': {'monitor': 'val_loss', 'factor': 0.5, 'patience': 5, 'mode': 'min',
+                            'min_lr': 1e-08, 'verbose': 1},
+                # 'checkpoint': {'monitor': 'val_sparse_categorical_accurac', 'save_best_only': True,
+                #                'save_weights_only': False, 'save_freq': 'epoch', 'verbose': 2}
+            }
         # ---Set the path for saving models---
         model_folder_name = time.strftime("%d%b%Y-%Hh%Mm%Ss")
         path_params = {'save_folder': os.path.join(self.__class__.__name__, model_folder_name),
                        'save_root_folder': 'data/models/',
                        'dataset': model_opts['dataset']}
         model_path, _ = get_path(**path_params, file_name='model.h5')
+        model_dir = os.path.dirname(model_path)
+        best_loss_path = os.path.join(model_dir, 'best_val_loss_model.h5')
+        best_acc_path = os.path.join(model_dir, 'best_val_acc_model.h5')
 
         # ---Read train and validation data---
         model_opts = {**model_opts, 'num_classes': model_opts.get('num_classes', 9)}
@@ -5786,16 +5876,58 @@ class MASK_PCPA_4_2D(ActionPredict):
 
         # ---Create model---
         train_model = self.get_model(data_train['data_params'])
+        loss_type = str(model_opts.get('loss_type', 'label_smoothing')).lower()
+        if loss_type in ['label_smoothing', 'smoothing', 'smooth_ce']:
+            label_smoothing = float(model_opts.get('label_smoothing', 0.05))
+            effective_loss = sparse_categorical_crossentropy_with_label_smoothing(label_smoothing)
+        elif loss_type in ['focal', 'focal_loss']:
+            f_alpha = model_opts.get('focal_alpha', None)
+            if f_alpha is not None:
+                if f_alpha == 'inv':
+                    f_alpha = 1.0 / np.array(data_train['count'])
+                    f_alpha = f_alpha / f_alpha.sum()
+                elif f_alpha == 'inv_sqrt':
+                    f_alpha = 1.0 / np.sqrt(np.array(data_train['count']))
+                    f_alpha = f_alpha / f_alpha.sum()
+                elif f_alpha == 'ratio':
+                    f_alpha = np.array(data_train['count'])/sum(data_train['count'])
+
+            effective_loss = sparse_categorical_focal_loss(
+                gamma=float(model_opts.get('focal_gamma', 2.0)),
+                alpha=f_alpha,
+                from_logits=bool(model_opts.get('loss_from_logits', False)),
+            )
+        elif loss_type in ['ce', 'crossentropy', 'sparse_categorical_crossentropy']:
+            effective_loss = tf.keras.losses.SparseCategoricalCrossentropy(
+                from_logits=bool(model_opts.get('loss_from_logits', False)))
+        else:
+            raise ValueError('Unsupported loss_type: {}'.format(loss_type))
 
         # ---Train the model, here first to configure the model---
-        class_w = self.class_weights(model_opts['apply_class_weights'], data_train['count'])
+        use_class_weights = bool(model_opts.get('apply_class_weights', False))
+        if loss_type in ['focal', 'focal_loss'] and not bool(model_opts.get('use_class_weight_with_focal', False)):
+            use_class_weights = False
+        class_w = self.class_weights(use_class_weights, data_train['count'])
         optimizer = self.get_optimizer(optimizer)(lr=lr)
-        train_model.compile(loss='sparse_categorical_crossentropy',
+        train_model.compile(loss=effective_loss,
                     optimizer=optimizer,
                     metrics=['sparse_categorical_accuracy'])
         # compile是 Keras 模型的编译函数，指定损失函数、优化器和评估指标等参数，设置模型状态
         ## ---reivse fit---
         callbacks = self.get_callbacks(learning_scheduler, model_path)
+        callbacks.append(ModelCheckpoint(filepath=best_loss_path,
+                                         monitor='val_loss',
+                                         save_best_only=True,
+                                         save_weights_only=False,
+                                         save_freq='epoch',
+                                         verbose=2))
+        callbacks.append(ModelCheckpoint(filepath=best_acc_path,
+                                         monitor='val_sparse_categorical_accuracy',
+                                         mode='max',
+                                         save_best_only=True,
+                                         save_weights_only=False,
+                                         save_freq='epoch',
+                                         verbose=2))
 
         # data_val = data_val.batch(batch_size)
         # 这里的
@@ -5809,9 +5941,9 @@ class MASK_PCPA_4_2D(ActionPredict):
                                   verbose=1,
                                   callbacks=callbacks)
         # 当缺失模型保存检查点时，手动保存模型
-        if 'checkpoint' not in learning_scheduler:
-            print('Train model is saved to {}'.format(model_path))
-            train_model.save(model_path)
+        # if 'checkpoint' not in learning_scheduler:
+        #     print('Train model is saved to {}'.format(model_path))
+        #     train_model.save(model_path)
 
         # ---Save data options and configurations---
         model_opts_path, _ = get_path(**path_params, file_name='model_opts.pkl')
@@ -5846,168 +5978,215 @@ class MASK_PCPA_4_2D(ActionPredict):
             #     model_opts = pickle.load(fid)
             # except:
             #     model_opts = pickle.load(fid, encoding='bytes')
-
-        test_model = load_model(os.path.join(model_path, 'model.h5'))
-        test_model.summary()
-
         model_opts = {**opts['model_opts'], 'num_classes': opts['model_opts'].get('num_classes', 9)}
         test_data = self.get_data('test', data_test, {**model_opts, 'batch_size': 1})
 
-        test_results = test_model.predict(test_data['data'][0],
-                                          batch_size=1, verbose=1)
-        y_true = np.array(test_data['data'][1]).reshape(-1).astype(np.int32)
-        y_pred = np.argmax(test_results, axis=1).astype(np.int32)
-        num_classes = test_results.shape[1]
+        def evaluate_and_save(saved_model_path, tag):
+            if not os.path.exists(saved_model_path):
+                print(f'Warning: missing model file {saved_model_path}, skipping {tag} evaluation.')
+                return None
 
-        acc = accuracy_score(y_true, y_pred)
-        class_ids = list(range(num_classes))
-        y_true_onehot = np.eye(num_classes, dtype=np.float32)[y_true]
+            test_model = load_model(saved_model_path, compile=False)
+            print(f'\n==== Evaluating {tag}: {saved_model_path} ====')
+            # test_model.summary()
 
-        # Per-class precision / recall / f1.
-        per_class_precision = np.asarray(
-            precision_score(y_true, y_pred, labels=class_ids, average=None, zero_division=0), dtype=np.float32)
-        per_class_recall = np.asarray(
-            recall_score(y_true, y_pred, labels=class_ids, average=None, zero_division=0), dtype=np.float32)
-        per_class_f1 = np.asarray(
-            f1_score(y_true, y_pred, labels=class_ids, average=None, zero_division=0), dtype=np.float32)
+            test_results = test_model.predict(test_data['data'][0], batch_size=1, verbose=1)
+            test_results = np.asarray(test_results, dtype=np.float64)
+            y_true = np.array(test_data['data'][1]).reshape(-1).astype(np.int32)
+            num_classes = test_results.shape[1]
 
-        # Weighted summary metrics.
-        precision_weighted = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-        recall_weighted = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-        f1_weighted = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+            # Clean non-finite values produced on some GPU/TF combinations
+            if not np.isfinite(test_results).all():
+                bad = int((~np.isfinite(test_results)).sum())
+                print(f"Warning: {bad} non-finite prediction values found; applying numeric cleanup.")
+                test_results = np.nan_to_num(test_results, nan=0.0, posinf=1.0, neginf=0.0)
 
-        # Cohen's kappa.
-        kappa = cohen_kappa_score(y_true, y_pred)
+            # Normalize to probabilities if outputs are logits or not proper probabilities
+            row_sums = np.sum(test_results, axis=1, keepdims=True)
+            if np.any(test_results < 0.0) or np.any(test_results > 1.0) or np.any(np.abs(row_sums - 1.0) > 1e-3):
+                shifted = test_results - np.max(test_results, axis=1, keepdims=True)
+                exp_scores = np.exp(shifted)
+                exp_sums = np.sum(exp_scores, axis=1, keepdims=True)
+                exp_sums[exp_sums <= 0] = 1.0
+                test_results = exp_scores / exp_sums
 
-        # Per-class AUC (one-vs-rest).
-        per_class_auc = {}
-        auc_values = []
-        for cls in class_ids:
-            y_true_cls = (y_true == cls).astype(np.int32)
-            # AUC is undefined if a class has only one label type in test split.
-            if np.unique(y_true_cls).size < 2:
-                per_class_auc[cls] = float('nan')
-                continue
-            auc_cls = roc_auc_score(y_true_cls, test_results[:, cls])
-            per_class_auc[cls] = float(auc_cls)
-            auc_values.append(float(auc_cls))
-        auc = float(np.mean(auc_values)) if len(auc_values) > 0 else float('nan')
+            # Filter invalid labels (e.g. -1) if any slipped through
+            valid_mask = np.logical_and(y_true >= 0, y_true < num_classes)
+            if not np.all(valid_mask):
+                removed = int((~valid_mask).sum())
+                print(f"Warning: Dropping {removed} test samples with invalid labels outside [0,{num_classes - 1}].")
+                y_true = y_true[valid_mask]
+                test_results = test_results[valid_mask]
 
-        # Cross-entropy (log loss): mean over samples and per-sample values.
-        eps = 1e-12
-        ce_per_sample = -np.log(np.clip(test_results[np.arange(len(y_true)), y_true], eps, 1.0))
-        ce_mean = float(np.mean(ce_per_sample)) if ce_per_sample.size > 0 else float('nan')
-        ce_std = float(np.std(ce_per_sample)) if ce_per_sample.size > 0 else float('nan')
-        try:
-            ce_log_loss = float(log_loss(y_true, test_results, labels=class_ids))
-        except ValueError:
-            print("log loss is setted to mean value")
-            ce_log_loss = ce_mean
+            if y_true.size == 0:
+                raise ValueError('No valid test samples after filtering invalid labels.')
 
-        # Confusion matrix.
-        cm = confusion_matrix(y_true, y_pred, labels=class_ids)
+            y_pred = np.argmax(test_results, axis=1).astype(np.int32)
+            acc = accuracy_score(y_true, y_pred)
+            class_ids = list(range(num_classes))
 
-        # Save confusion matrix plot.
-        cm_fig_path = os.path.join(model_path, 'confusion_matrix.png')
-        plt.figure(figsize=(8, 6))
-        plt.imshow(cm, interpolation='nearest', cmap='Blues')
-        plt.title('Confusion Matrix')
-        plt.colorbar()
-        tick_marks = np.arange(num_classes)
-        plt.xticks(tick_marks, tick_marks)
-        plt.yticks(tick_marks, tick_marks)
-        plt.xlabel('Predicted Label')
-        plt.ylabel('True Label')
-        thresh = cm.max() / 2.0 if cm.size > 0 else 0
-        for i in range(cm.shape[0]):
-            for j in range(cm.shape[1]):
-                plt.text(j, i, format(cm[i, j], 'd'),
-                         ha='center', va='center',
-                         color='white' if cm[i, j] > thresh else 'black')
-        plt.tight_layout()
-        plt.savefig(cm_fig_path, dpi=200)
-        plt.close()
+            # Per-class precision / recall / f1.
+            per_class_precision = np.asarray(
+                precision_score(y_true, y_pred, labels=class_ids, average=None, zero_division=0), dtype=np.float32)
+            per_class_recall = np.asarray(
+                recall_score(y_true, y_pred, labels=class_ids, average=None, zero_division=0), dtype=np.float32)
+            per_class_f1 = np.asarray(
+                f1_score(y_true, y_pred, labels=class_ids, average=None, zero_division=0), dtype=np.float32)
 
-        # Save one-vs-rest ROC curves.
-        roc_fig_path = os.path.join(model_path, 'roc_curves_ovr.png')
-        plt.figure(figsize=(8, 6))
-        has_valid_roc = False
-        for cls in class_ids:
-            y_true_cls = (y_true == cls).astype(np.int32)
-            if np.unique(y_true_cls).size < 2:
-                continue
-            fpr, tpr, _ = roc_curve(y_true_cls, test_results[:, cls])
-            auc_cls = per_class_auc[cls]
-            plt.plot(fpr, tpr, lw=1.5, label='Class {} (AUC={:.3f})'.format(cls, auc_cls))
-            has_valid_roc = True
-        plt.plot([0, 1], [0, 1], 'k--', lw=1)
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title('One-vs-Rest ROC Curves')
-        if has_valid_roc:
-            plt.legend(loc='lower right', fontsize=8)
-        plt.tight_layout()
-        plt.savefig(roc_fig_path, dpi=200)
-        plt.close()
+            # Weighted summary metrics.
+            precision_weighted = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+            recall_weighted = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+            f1_weighted = f1_score(y_true, y_pred, average='weighted', zero_division=0)
 
-        # Print only requested aggregate metrics.
-        print('acc:{:.4f} precision_weighted:{:.4f} recall_weighted:{:.4f} f1_weighted:{:.4f} '
-              'kappa:{:.4f} auc_mean_per_class:{:.4f} ce_mean:{:.6f} ce_std:{:.6f}'.format(
-            acc,
-            precision_weighted,
-            recall_weighted,
-            f1_weighted,
-            kappa,
-            auc if not np.isnan(auc) else -1.0,
-            ce_mean if not np.isnan(ce_mean) else -1.0,
-            ce_std if not np.isnan(ce_std) else -1.0))
-        print('saved figures: {}, {}'.format(cm_fig_path, roc_fig_path))
-        
-        # THIS IS TEMPORARY, REMOVE BEFORE RELEASE
-        with open(os.path.join(model_path, 'test_output.pkl'), 'wb') as picklefile:
-            pickle.dump({'tte': test_data['tte'],
-                         'pid': test_data['ped_id'],
-                         'gt': y_true,
-                         'y_prob': test_results,
-                         'y_pred': y_pred,
-                         'confusion_matrix': cm,
-                         'ce_per_sample': ce_per_sample,
-                         'image': test_data['image']}, picklefile)
+            # Cohen's kappa.
+            kappa = cohen_kappa_score(y_true, y_pred)
 
-        # Save summary metrics to CSV (instead of YAML).
-        summary_csv_path = os.path.join(model_path, 'metrics_summary.csv')
-        with open(summary_csv_path, 'w') as fid:
-            fid.write('acc,precision_weighted,recall_weighted,f1_weighted,kappa,auc_mean_per_class,ce_mean,ce_std,ce_log_loss,confusion_matrix_plot,roc_ovr_plot\n')
-            fid.write('{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{},{}\n'.format(
-                float(acc),
-                float(precision_weighted),
-                float(recall_weighted),
-                float(f1_weighted),
-                float(kappa),
-                float(auc) if not np.isnan(auc) else float('nan'),
-                float(ce_mean) if not np.isnan(ce_mean) else float('nan'),
-                float(ce_std) if not np.isnan(ce_std) else float('nan'),
-                float(ce_log_loss) if not np.isnan(ce_log_loss) else float('nan')))
-
-        # Save per-class metrics to CSV.
-        per_class_csv_path = os.path.join(model_path, 'per_class_metrics.csv')
-        with open(per_class_csv_path, 'w') as fid:
-            fid.write('class_id,precision,recall,f1,auc\n')
+            # Per-class AUC (one-vs-rest).
+            per_class_auc = {}
+            auc_values = []
             for cls in class_ids:
-                cls_auc = per_class_auc[cls]
-                fid.write('{},{:.10f},{:.10f},{:.10f},{}\n'.format(
-                    cls,
-                    float(per_class_precision[int(cls)]),
-                    float(per_class_recall[int(cls)]),
-                    float(per_class_f1[int(cls)]),
-                    '{:.10f}'.format(float(cls_auc)) if not np.isnan(cls_auc) else 'nan'))
+                y_true_cls = (y_true == cls).astype(np.int32)
+                if np.unique(y_true_cls).size < 2:
+                    per_class_auc[cls] = float('nan')
+                    continue
+                auc_cls = roc_auc_score(y_true_cls, test_results[:, cls])
+                per_class_auc[cls] = float(auc_cls)
+                auc_values.append(float(auc_cls))
+            auc = float(np.mean(auc_values)) if len(auc_values) > 0 else float('nan')
 
-        # Save confusion matrix values to CSV.
-        cm_csv_path = os.path.join(model_path, 'confusion_matrix.csv')
-        np.savetxt(cm_csv_path, cm, fmt='%d', delimiter=',')
+            # Cross-entropy (log loss): mean over samples and per-sample values.
+            eps = 1e-12
+            ce_per_sample = -np.log(np.clip(test_results[np.arange(len(y_true)), y_true], eps, 1.0))
+            ce_mean = float(np.mean(ce_per_sample)) if ce_per_sample.size > 0 else float('nan')
+            ce_std = float(np.std(ce_per_sample)) if ce_per_sample.size > 0 else float('nan')
+            try:
+                ce_log_loss = float(log_loss(y_true, test_results, labels=class_ids))
+            except ValueError:
+                print("log loss is setted to mean value")
+                ce_log_loss = ce_mean
 
-        print('saved csv: {}, {}, {}'.format(summary_csv_path, per_class_csv_path, cm_csv_path))
-        return acc, auc, f1_weighted, precision_weighted, recall_weighted
+            # Confusion matrix.
+            cm = confusion_matrix(y_true, y_pred, labels=class_ids)
+
+            # Save confusion matrix plot.
+            cm_fig_path = os.path.join(model_path, f'confusion_matrix_{tag}.png')
+            plt.figure(figsize=(8, 6))
+            plt.imshow(cm, interpolation='nearest', cmap='Blues')
+            plt.title(f'Confusion Matrix ({tag})')
+            plt.colorbar()
+            tick_marks = np.arange(num_classes)
+            plt.xticks(tick_marks, tick_marks)
+            plt.yticks(tick_marks, tick_marks)
+            plt.xlabel('Predicted Label')
+            plt.ylabel('True Label')
+            thresh = cm.max() / 2.0 if cm.size > 0 else 0
+            for i in range(cm.shape[0]):
+                for j in range(cm.shape[1]):
+                    plt.text(j, i, format(cm[i, j], 'd'),
+                             ha='center', va='center',
+                             color='white' if cm[i, j] > thresh else 'black')
+            plt.tight_layout()
+            plt.savefig(cm_fig_path, dpi=200)
+            plt.close()
+
+            # Save one-vs-rest ROC curves.
+            roc_fig_path = os.path.join(model_path, f'roc_curves_ovr_{tag}.png')
+            plt.figure(figsize=(8, 6))
+            has_valid_roc = False
+            for cls in class_ids:
+                y_true_cls = (y_true == cls).astype(np.int32)
+                if np.unique(y_true_cls).size < 2:
+                    continue
+                fpr, tpr, _ = roc_curve(y_true_cls, test_results[:, cls])
+                auc_cls = per_class_auc[cls]
+                plt.plot(fpr, tpr, lw=1.5, label='Class {} (AUC={:.3f})'.format(cls, auc_cls))
+                has_valid_roc = True
+            plt.plot([0, 1], [0, 1], 'k--', lw=1)
+            plt.xlabel('False Positive Rate')
+            plt.ylabel('True Positive Rate')
+            plt.title(f'One-vs-Rest ROC Curves ({tag})')
+            if has_valid_roc:
+                plt.legend(loc='lower right', fontsize=8)
+            plt.tight_layout()
+            plt.savefig(roc_fig_path, dpi=200)
+            plt.close()
+
+            # Print aggregate metrics.
+            print('acc:{:.4f} precision_weighted:{:.4f} recall_weighted:{:.4f} f1_weighted:{:.4f} '
+                  'kappa:{:.4f} auc_mean_per_class:{:.4f} ce_mean:{:.6f} ce_std:{:.6f}'.format(
+                acc,
+                precision_weighted,
+                recall_weighted,
+                f1_weighted,
+                kappa,
+                auc if not np.isnan(auc) else -1.0,
+                ce_mean if not np.isnan(ce_mean) else -1.0,
+                ce_std if not np.isnan(ce_std) else -1.0))
+            print('saved figures: {}, {}'.format(cm_fig_path, roc_fig_path))
+
+            # Save summary metrics to CSV.
+            summary_csv_path = os.path.join(model_path, f'metrics_summary_{tag}.csv')
+            with open(summary_csv_path, 'w') as fid:
+                fid.write(
+                    'acc,precision_weighted,recall_weighted,f1_weighted,kappa,auc_mean_per_class,ce_mean,ce_std,ce_log_loss,confusion_matrix_plot,roc_ovr_plot\n')
+                fid.write('{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{:.10f},{:.10f}\n'.format(
+                    float(acc),
+                    float(precision_weighted),
+                    float(recall_weighted),
+                    float(f1_weighted),
+                    float(kappa),
+                    float(auc) if not np.isnan(auc) else float('nan'),
+                    float(ce_mean) if not np.isnan(ce_mean) else float('nan'),
+                    float(ce_std) if not np.isnan(ce_std) else float('nan'),
+                    float(ce_log_loss) if not np.isnan(ce_log_loss) else float('nan')))
+
+            # Save per-class metrics to CSV.
+            per_class_csv_path = os.path.join(model_path, f'per_class_metrics_{tag}.csv')
+            with open(per_class_csv_path, 'w') as fid:
+                fid.write('class_id,precision,recall,f1,auc\n')
+                for cls in class_ids:
+                    cls_auc = per_class_auc[cls]
+                    fid.write('{},{:.10f},{:.10f},{:.10f},{}\n'.format(
+                        cls,
+                        float(per_class_precision[int(cls)]),
+                        float(per_class_recall[int(cls)]),
+                        float(per_class_f1[int(cls)]),
+                        '{:.10f}'.format(float(cls_auc)) if not np.isnan(cls_auc) else 'nan'))
+
+            # Save confusion matrix values to CSV.
+            cm_csv_path = os.path.join(model_path, f'confusion_matrix_{tag}.csv')
+            np.savetxt(cm_csv_path, cm, fmt='%d', delimiter=',')
+
+            print('saved csv: {}, {}, {}'.format(summary_csv_path, per_class_csv_path, cm_csv_path))
+            return {
+                'acc': acc,
+                'auc': auc,
+                'f1_weighted': f1_weighted,
+                'precision_weighted': precision_weighted,
+                'recall_weighted': recall_weighted,
+                'model_file': saved_model_path,
+                'tag': tag,
+            }
+
+        candidates = [
+            ('best_val_loss', os.path.join(model_path, 'best_val_loss_model.h5')),
+            ('best_val_acc', os.path.join(model_path, 'best_val_acc_model.h5')),
+        ]
+        if not any(os.path.exists(path) for _, path in candidates):
+            candidates = [('default', os.path.join(model_path, 'model.h5'))]
+
+        evaluated = []
+        for tag, saved_model_path in candidates:
+            result = evaluate_and_save(saved_model_path, tag)
+            if result is not None:
+                evaluated.append(result)
+
+        if not evaluated:
+            raise FileNotFoundError('No model files found to evaluate in {}'.format(model_path))
+
+        primary = next((item for item in evaluated if item['tag'] == 'best_val_loss'), evaluated[0])
+        return primary['acc'], primary['auc'], primary['f1_weighted'], primary['precision_weighted'], primary[
+            'recall_weighted']
 
 
 

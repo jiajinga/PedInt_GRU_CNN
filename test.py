@@ -29,8 +29,43 @@ def test_model(saved_files_path=None):
         opts = yaml.safe_load(yamlfile)
     print(opts)
     model_opts = opts['model_opts']
-    data_opts = opts['data_opts']
-    net_opts = opts['net_opts']
+    if 'data_opts' in opts and opts['data_opts'] is not None:
+        data_opts = opts['data_opts'].copy()
+    else:
+        dataset_name = model_opts.get('dataset', 'pie')
+        if dataset_name == 'pie':
+            default_cfg_path = 'config_files_pie/configs_default.yaml'
+        elif dataset_name == 'jaad':
+            default_cfg_path = 'config_files/configs_default.yaml'
+        else:
+            raise ValueError(f"Unknown dataset: {dataset_name}")
+
+        with open(default_cfg_path, 'r') as f:
+            default_opts = yaml.safe_load(f)
+
+        if 'data_opts' not in default_opts:
+            raise KeyError(f"data_opts not found in default config: {default_cfg_path}")
+
+        data_opts = default_opts['data_opts'].copy()
+
+    if 'net_opts' in opts and opts['net_opts'] is not None:
+        net_opts = opts['net_opts'].copy()
+    else:
+        dataset_name = model_opts.get('dataset', 'pie')
+        if dataset_name == 'pie':
+            default_net_path = 'config_files_pie/GC_PIE_small.yaml'
+        elif dataset_name == 'jaad':
+            default_net_path = 'config_files/GC_jaad_small.yaml'
+        else:
+            raise ValueError(f"Unknown dataset: {dataset_name}")
+
+        with open(default_net_path, 'r') as f:
+            default_net_opts = yaml.safe_load(f)
+
+        if 'net_opts' not in default_net_opts:
+            raise KeyError(f"net_opts not found in default config: {default_net_path}")
+
+        net_opts = default_net_opts['net_opts'].copy()
 
     tte = model_opts['time_to_event'] if isinstance(model_opts['time_to_event'], int) else \
                 model_opts['time_to_event'][1]
